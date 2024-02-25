@@ -1,0 +1,7 @@
+python train.py --train_data '../Data/Synthetic_train_data_without_exp.csv' --with_exp_id 'No' --model_type 'GB'
+python train.py --train_data '../Data/Synthetic_train_data_without_exp.csv' --with_exp_id 'No' --model_type 'XGB'
+python train.py --train_data '../Data/Synthetic_train_data_without_exp.csv' --with_exp_id 'No' --model_type 'RF'
+
+python train.py --train_data '../Data/Synthetic_train_data_with_exp.csv' --with_exp_id 'Yes' --model_type 'GB'
+python train.py --train_data '../Data/Synthetic_train_data_with_exp.csv' --with_exp_id 'Yes' --model_type 'XGB'
+python train.py --train_data '../Data/Synthetic_train_data_with_exp.csv' --with_exp_id 'Yes' --model_type 'RF'
