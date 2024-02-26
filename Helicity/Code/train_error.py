@@ -72,7 +72,7 @@ class Train_Error:
 
                 if len(rv)==data.shape[0] and len(pv)==data.shape[0]:
                     rmse = np.sqrt(mean_squared_error(rv,pv))
-                    print(f"Model={model_type}, useExp={key}, RMSE={rmse:.3f}")
+                    print(f"Model={model_type}, useExp={key}, RMSE={rmse:.4f}")
                 
 if __name__=="__main__":
     te = Train_Error()
