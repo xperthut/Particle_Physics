@@ -5,3 +5,12 @@ python train.py --train_data '../Data/Synthetic_train_data_without_exp.csv' --wi
 python train.py --train_data '../Data/Synthetic_train_data_with_exp.csv' --with_exp_id 'Yes' --model_type 'GB'
 python train.py --train_data '../Data/Synthetic_train_data_with_exp.csv' --with_exp_id 'Yes' --model_type 'XGB'
 python train.py --train_data '../Data/Synthetic_train_data_with_exp.csv' --with_exp_id 'Yes' --model_type 'RF'
+
+
+sbatch run_train.slum ../Data/Synthetic_train_data_with_exp.csv 'XGB' 'Yes'
+sbatch run_train.slum ../Data/Synthetic_train_data_with_exp.csv 'GB' 'Yes'
+sbatch run_train.slum ../Data/Synthetic_train_data_with_exp.csv 'RF' 'Yes'
+
+sbatch run_train.slum ../Data/Synthetic_train_data_without_exp.csv 'GB' 'No'
+sbatch run_train.slum ../Data/Synthetic_train_data_without_exp.csv 'XGB' 'No'
+sbatch run_train.slum ../Data/Synthetic_train_data_without_exp.csv 'RF' 'No'
