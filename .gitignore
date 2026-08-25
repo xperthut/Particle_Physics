@@ -1,0 +1,34 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Editors / IDEs
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Data and model artifacts
+Data/
+model/
+Model/
+
+# Claude Code
+CLAUDE.md
+.claude/
+
