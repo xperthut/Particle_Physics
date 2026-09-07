@@ -23,8 +23,14 @@ env/
 # Logs
 *.log
 
-# Data and model artifacts
-Data/
+# Data: only .txt files are tracked (raw/source data). Generated .csv
+# frames, plots, zips, intermediate binaries, etc. under a Data/ folder are
+# produced by the pipeline scripts and left untracked.
+**/Data/**
+!**/Data/**/
+!**/Data/**/*.txt
+
+# Trained models and other model artifacts are never uploaded.
 model/
 Model/
 

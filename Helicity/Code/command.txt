@@ -1,16 +1,25 @@
-python train.py --train_data '../Data/Synthetic_train_data_without_exp.csv' --with_exp_id 'No' --model_type 'GB'
-python train.py --train_data '../Data/Synthetic_train_data_without_exp.csv' --with_exp_id 'No' --model_type 'XGB'
-python train.py --train_data '../Data/Synthetic_train_data_without_exp.csv' --with_exp_id 'No' --model_type 'RF'
+python train.py --fm all --with_exp_id 'No' --model_type 'GB'
+python train.py --fm all --with_exp_id 'No' --model_type 'XGB'
+python train.py --fm all --with_exp_id 'No' --model_type 'RF'
 
-python train.py --train_data '../Data/Synthetic_train_data_with_exp.csv' --with_exp_id 'Yes' --model_type 'GB'
-python train.py --train_data '../Data/Synthetic_train_data_with_exp.csv' --with_exp_id 'Yes' --model_type 'XGB'
-python train.py --train_data '../Data/Synthetic_train_data_with_exp.csv' --with_exp_id 'Yes' --model_type 'RF'
+python train.py --fm all --with_exp_id 'Yes' --model_type 'GB'
+python train.py --fm all --with_exp_id 'Yes' --model_type 'XGB'
+python train.py --fm all --with_exp_id 'Yes' --model_type 'RF'
 
+# Single ensemble, e.g. FM 9 only:
+python train.py --fm 9 --with_exp_id 'Yes' --model_type 'XGB'
 
-sbatch run_train.slum ../Data/Synthetic_train_data_with_exp.csv 'XGB' 'Yes'
-sbatch run_train.slum ../Data/Synthetic_train_data_with_exp.csv 'GB' 'Yes'
-sbatch run_train.slum ../Data/Synthetic_train_data_with_exp.csv 'RF' 'Yes'
-
-sbatch run_train.slum ../Data/Synthetic_train_data_without_exp.csv 'GB' 'No'
-sbatch run_train.slum ../Data/Synthetic_train_data_without_exp.csv 'XGB' 'No'
-sbatch run_train.slum ../Data/Synthetic_train_data_without_exp.csv 'RF' 'No'
+# Reads Data/2026/Synthetic_train_data_{with,without}_exp_{fm}.csv (written by
+# prepare_train_test_data.py) and writes, per FM:
+#   model/2026/{fm}/{model_type}_exp_{with_exp_id}.sav           (list of per-P fitted estimators)
+#   model/2026/{fm}/{model_type}_exp_{with_exp_id}_best_params.json  (per-P best hyperparameters found by BayesSearchCV)
+#
+# Speed knobs (defaults: n_iter=20, cv_splits=5, search_sample_size=20000):
+# the search phase runs on at most --search_sample_size rows per P with
+# --cv_splits TimeSeriesSplit folds; the winning hyperparameters are then
+# refit on the FULL per-P data, so these only trade search precision for
+# speed, not final-model accuracy. Progress prints per BayesSearchCV
+# iteration since a full run is otherwise silent for a long time. GB is the
+# slowest model type (sequential boosting, no internal parallelism) --
+# lower --n_iter/--search_sample_size for it first if it's too slow, e.g.:
+#   python train.py --fm 9 --with_exp_id 'Yes' --model_type 'GB' --n_iter 10 --search_sample_size 10000
