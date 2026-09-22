@@ -8,11 +8,11 @@ Two stages, both per lattice ensemble (``FM`` = 09 / 12 / 15):
 2. ``generate_m_omega_from_I_omega`` -- for each FM:
      a. read the fitted I(omega) line and interpolate it onto the real omega
         grid of that ensemble;
-     b. fit m1 = M(omega, P=1) and m2 = M(omega, P=2) by gradient descent on
-            I = (4/3) m2 - (1/3) m1
-        seeded from ``m1 = alpha * I(omega)``, ``m2 = beta``;
-     c. derive the higher moments from m1 via
-            m_n = ((n^2 - 1) * I + m1) / n^2 ;
+     b. fit mi = M(omega, P=i) and mj = M(omega, P=j) where j>i>0, by gradient descent on
+            I = ((j^2 * mj) - (i^2 * mi)) / (j^2 - i^2)
+        seeded from ``mi = alpha * I(omega)``, ``mj = beta``;
+     c. derive the higher moments (mj, j>i) from mi via
+            mj = ((j^2 - i^2) * I + (i^2*mi)) / j^2 ;
      d. search for the (alpha, beta) that minimise the absolute difference
         between the generated and the real mean M at the matched omega values.
 
@@ -28,12 +28,16 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 from scipy import stats
 from scipy.optimize import minimize
+from scipy.signal import savgol_filter
 
 warnings.filterwarnings("ignore")
 pd.options.mode.chained_assignment = None
 
 mpl.rcParams['figure.figsize'] = (12, 10)
 mpl.rcParams.update({'font.size': 22})
+
+SMOOTH_WINDOW = 60       # Savitzky-Golay window in grid points (0.1 each)
+SMOOTH_POLYORDER = 3
 
 VERSION = 2026
 DATA_DIR = f'../Data/{VERSION}/'
@@ -42,15 +46,33 @@ IMG_DIR = f'../Data/{VERSION}/Images/'
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(IMG_DIR, exist_ok=True)
 
-# I(omega) = B * m2 + A * m1  with  A = -1/3, B = 4/3
-A, B = -1.0 / 3.0, 4.0 / 3.0
+def get_smooth_curve(val, window=SMOOTH_WINDOW, polyorder=SMOOTH_POLYORDER):
+    """Savitzky-Golay smooth of a 1-D series on a uniform grid.
+
+    The window is forced odd and shrunk to fit short inputs; if it cannot be
+    made larger than ``polyorder`` the series is returned unchanged.
+    """
+    val = np.asarray(val, dtype=float)
+    n = val.size
+    w = min(int(window), n if n % 2 == 1 else n - 1)
+    if w <= polyorder or w < 5:
+        return val
+    return savgol_filter(val, window_length=w, polyorder=polyorder, mode='interp')
+
+# I(omega) = B*mj + A*mi for the directly-fit momentum pair (i, j), j>i>=1,
+# with A = -i^2/(j^2-i^2), B = j^2/(j^2-i^2). (i, j) = (1, 2) -- A=-1/3,
+# B=4/3 -- is this repo's default pair everywhere below.
+def _ab_for_pair(i, j):
+    """(A, B) coefficients of I = A*mi + B*mj for momentum pair i<j."""
+    denom = float(j ** 2 - i ** 2)
+    return -(i ** 2) / denom, (j ** 2) / denom
 
 # The real omega grid is irregular (multiples of pz * const) while the fitted
 # ITD line is sampled every 0.1.  Round both to one decimal and compare as
 # integers so the merge in stage 2 is exact.
 W_SCALE = 10
 
-# Gradient-descent hyper-parameters for the m1/m2 fit.
+# Gradient-descent hyper-parameters for the mi/mj fit.
 LR = 0.01
 EPOCHS = 100
 
@@ -140,55 +162,90 @@ def plot_I_omega(df_I):
     plt.close()
 
 
-def fit_m1_m2(I_omega, alpha, beta, record_loss=False, omega=None):
-    """Gradient-descent fit of m1, m2 to ``I = B*m2 + A*m1`` for each omega.
+def fit_mi_mj(I_omega, alpha, beta, i=1, j=2, record_loss=False, omega=None):
+    """Gradient-descent fit of ``mi``, ``mj`` -- the directly-fit momentum
+    pair, ``j>i>=1``, default ``(i, j) = (1, 2)`` -- to
+    ``I = A*mi + B*mj`` for each omega, with
+    ``A = -i^2/(j^2-i^2)``, ``B = j^2/(j^2-i^2)`` (see ``_ab_for_pair``).
 
-    ``I_omega`` is a 1-D array of I values.  The seed is ``m1 = alpha * I``,
-    ``m2 = beta``.  All omega points are optimised together (they are
-    independent).  Returns ``(m1, m2)`` arrays; if ``record_loss`` also returns
+    ``I_omega`` is a 1-D array of I values.  The seed is ``mi = alpha * I``,
+    ``mj = beta * I``.  All omega points are optimised together (they are
+    independent).  Returns ``(mi, mj)`` arrays; if ``record_loss`` also returns
     a long-form DataFrame with per-epoch loss (needs ``omega`` for labelling).
+
+    ``record_loss`` defaults to False: every caller except the one explicit
+    "per-epoch loss trace" call in ``generate_m_omega_from_I_omega`` (which
+    passes both ``record_loss=True`` and ``omega=``) relies on this default --
+    notably ``estimate_M`` and ``_fit``'s ``objective`` (the latter runs this
+    thousands of times per optimisation), neither of which pass ``omega``, so
+    a True default crashes them (``zip(None, ...)``).
+
+    Both seeds scale with ``I`` (not just ``mi``'s) so the whole trajectory
+    -- not just the endpoint -- passes through (0, 0) as ``I -> 0``: a flat
+    ``mj = beta`` seed stays at ``beta`` regardless of how small ``I`` is,
+    so with the limited (100-epoch) convergence budget below, nearby-omega
+    points land close to that nonzero seed, producing a visible jump against
+    ``estimate_M``'s explicit ``M(omega=0)=0`` anchor. Proportional seeding
+    removes the discontinuity at its source rather than patching the one
+    boundary point.
     """
+    Ai, Bj = _ab_for_pair(i, j)
     y = np.asarray(I_omega, dtype=float)
-    m1 = alpha * y
-    m2 = np.full_like(y, float(beta))
+    mi = alpha * y
+    mj = beta * y
 
     loss_rows = [] if record_loss else None
     for ep in range(1, EPOCHS):
-        pred = A * m1 + B * m2
+        pred = Ai * mi + Bj * mj
         resid = y - pred                       # (Yreal - Ypred)
         if record_loss:
             for w_i, l_i in zip(omega, resid ** 2):
                 loss_rows.append({'epoch': ep, 'w': w_i, 'loss': l_i})
-        m1 = m1 - LR * (-2.0 * A * resid)
-        m2 = m2 - LR * (-2.0 * B * resid)
+        mi = mi - LR * (-2.0 * Ai * resid)
+        mj = mj - LR * (-2.0 * Bj * resid)
 
     if record_loss:
-        return m1, m2, pd.DataFrame(loss_rows)
-    return m1, m2
+        return mi, mj, pd.DataFrame(loss_rows)
+    return mi, mj
 
 
-def estimate_M(omega, I_omega, n_p, alpha, beta, gamma=0.0):
+def fit_m1_m2(I_omega, alpha, beta, record_loss=False, omega=None):
+    """Backward-compatible alias for ``fit_mi_mj`` with the default (i, j) = (1, 2)."""
+    return fit_mi_mj(I_omega, alpha, beta, 1, 2, record_loss, omega)
+
+
+def estimate_M(omega, I_omega, n_p, alpha, beta, gamma=0.0, i=1, j=2):
     """Long-form generated M: columns ``W``, ``P`` (1..n_p), ``Est_M``, ``Wkey``.
 
-    ``gamma`` -- damping of the derived high-P moments (option A).  The closed
-    form ``m_k = ((k^2-1) I + m1) / k^2`` tends to ``I(omega)`` as k grows, which
-    over-predicts the real data at P>=3.  ``gamma`` multiplies each derived
-    moment by ``exp(-gamma * (k - 2))`` so the tail can be pulled down without
-    touching the directly-fit m1 (P=1) and m2 (P=2).  ``gamma=0`` is the
+    ``i, j`` (default 1, 2) -- the directly-fit momentum pair: ``mi``, ``mj``
+    come from ``fit_mi_mj``; every other P's moment is the closed form
+    ``m_k = ((k^2-i^2)*I + i^2*mi) / k^2``, the algebraic inverse of
+    ``I = (k^2*m_k - i^2*mi)/(k^2-i^2)`` for *every* k -- so with gamma=0 any
+    two P's reconstruct the same I(omega), a physical requirement (I(omega)
+    must not depend on which momentum pair estimated it).
+
+    ``gamma`` -- damping of the derived (P not in {i, j}) moments (option A).
+    The closed form tends to ``I(omega)`` as k grows past ``j``, which
+    over-predicts the real data at high P.  ``gamma`` multiplies each derived
+    moment by ``exp(-gamma * (k - j))`` so the tail can be pulled down
+    without touching the directly-fit ``mi``, ``mj``.  ``gamma=0`` is the
     original ansatz.
     """
-    m1, m2 = fit_m1_m2(I_omega, alpha, beta)
+    mi, mj = fit_mi_mj(I_omega, alpha, beta, i, j)
     y = np.asarray(I_omega, dtype=float)
 
-    # M(omega=0, P) = 0 exactly by construction (I(0) = 0); the GD seed m2=beta
-    # would otherwise leave a spurious non-zero value there.
+    # M(omega=0, P) = 0 exactly by construction (I(0) = 0). fit_mi_mj's seeds
+    # are both proportional to I, so this is already ~0 up to the GD's
+    # 100-epoch convergence residual; this mask just makes it exact.
     zero = y == 0.0
-    m1 = np.where(zero, 0.0, m1)
-    m2 = np.where(zero, 0.0, m2)
+    mi = np.where(zero, 0.0, mi)
+    mj = np.where(zero, 0.0, mj)
 
-    cols = {'W': np.asarray(omega, dtype=float), 1: m1, 2: m2}
-    for k in range(3, n_p + 1):
-        cols[k] = (((k ** 2 - 1) * y + m1) / (k ** 2)) * np.exp(-gamma * (k - 2))
+    cols = {'W': np.asarray(omega, dtype=float), i: mi, j: mj}
+    for k in range(1, n_p + 1):
+        if k in (i, j):
+            continue
+        cols[k] = (((k ** 2 - i ** 2) * y + (i ** 2) * mi) / (k ** 2)) * np.exp(-gamma * (k - j))
 
     df = pd.DataFrame(cols).melt(id_vars='W', var_name='P', value_name='Est_M')
     df['P'] = df['P'].astype(int)
@@ -220,15 +277,27 @@ def match_real_and_estimated_M(df_real_g, df_est, weights=None):
     return diff, len(merged)
 
 
-def _fit(df_real_g, omega, I_omega, n_p, seeds, use_gamma, weights):
+def _fit(df_real_g, omega, I_omega, n_p, seeds, use_gamma, weights, monotonic_penalty=0.0,
+         i=1, j=2):
     """Multi-start Nelder-Mead core shared by the fit_* functions.
+
+    ``i, j`` (default 1, 2) -- the directly-fit momentum pair (see ``estimate_M``).
 
     The objective is evaluated with plain numpy (no per-iteration DataFrame
     build) since it runs thousands of times.
+
+    ``monotonic_penalty`` (0 = off) adds ``penalty * sum(max(0, rel[p+1] -
+    rel[p])**2)`` over consecutive P, where ``rel[p]`` is P's RMS-relative
+    error (as in ``_per_p_rel_rms``) -- i.e. it pushes the search away from
+    any (alpha, beta) where a *higher* P fits worse than the P below it.
+    Needed because P not in {i, j} are algebraically derived from mi/I with
+    no separate free parameter (see ``generate_m_omega_from_I_omega``'s
+    docstring): the per-P weight alone shifts the P=i-vs-P=j balance but
+    cannot on its own guarantee a strict best-at-highest-P ordering overall.
     """
     y = np.asarray(I_omega, dtype=float)
     y_zero = y == 0.0
-    key_to_pos = {int(k): i for i, k in enumerate(_w_key(omega))}
+    key_to_pos = {int(k): idx for idx, k in enumerate(_w_key(omega))}
 
     # df_real_g carries a RangeIndex (real_mean_M resets it), so weights[] aligns
     # by position and survives the Wkey filter below.
@@ -238,6 +307,8 @@ def _fit(df_real_g, omega, I_omega, n_p, seeds, use_gamma, weights):
     P = real['P'].to_numpy(dtype=float)
     real_M = real['Mean_M'].to_numpy(dtype=float)
     w = np.ones(mask.sum()) if weights is None else np.asarray(weights, dtype=float)[mask]
+    P_sorted = np.sort(np.unique(P))
+    p_masks = [P == p for p in P_sorted] if monotonic_penalty > 0.0 else None
 
     def objective(params):
         if use_gamma:
@@ -247,13 +318,22 @@ def _fit(df_real_g, omega, I_omega, n_p, seeds, use_gamma, weights):
             gamma = 0.0
         if len(pos) == 0:
             return np.inf
-        m1, m2 = fit_m1_m2(y, alpha, beta)
-        m1 = np.where(y_zero, 0.0, m1)[pos]
-        m2 = np.where(y_zero, 0.0, m2)[pos]
+        mi, mj = fit_mi_mj(y, alpha, beta, i, j)
+        mi = np.where(y_zero, 0.0, mi)[pos]
+        mj = np.where(y_zero, 0.0, mj)[pos]
         yi = y[pos]
-        derived = ((P ** 2 - 1.0) * yi + m1) / (P ** 2) * np.exp(-gamma * (P - 2.0))
-        est = np.where(P == 1.0, m1, np.where(P == 2.0, m2, derived))
-        return float(np.sum(w * np.abs(real_M - est)))
+        derived = ((P ** 2 - i * i) * yi + (i * i) * mi) / (P ** 2) * np.exp(-gamma * (P - j))
+        est = np.where(P == float(i), mi, np.where(P == float(j), mj, derived))
+        total = float(np.sum(w * np.abs(real_M - est)))
+
+        if monotonic_penalty > 0.0:
+            rel = np.empty(len(P_sorted))
+            for idx, m in enumerate(p_masks):
+                denom = np.sqrt(np.mean(real_M[m] ** 2))
+                rel[idx] = np.sqrt(np.mean((real_M[m] - est[m]) ** 2)) / denom if denom > 0 else 0.0
+            violation = np.maximum(0.0, rel[1:] - rel[:-1])
+            total += monotonic_penalty * float(np.sum(violation ** 2))
+        return total
 
     best = None
     for x0 in seeds:
@@ -264,35 +344,62 @@ def _fit(df_real_g, omega, I_omega, n_p, seeds, use_gamma, weights):
     return best
 
 
-def fit_alpha_beta(df_real_g, omega, I_omega, n_p):
-    """Baseline: (alpha, beta) minimising the unweighted sum |Mean_M - Est_M|."""
-    seeds = [(a, b) for a in (1.0, 10.0, 50.0, 310.0, 1000.0) for b in (-0.1, 0.0, 0.1)]
-    best = _fit(df_real_g, omega, I_omega, n_p, seeds, use_gamma=False, weights=None)
+def fit_alpha_beta(df_real_g, omega, I_omega, n_p, i=1, j=2):
+    """Baseline: (alpha, beta) minimising the unweighted sum |Mean_M - Est_M|.
+
+    ``i, j`` (default 1, 2) -- the directly-fit momentum pair (see ``estimate_M``).
+    """
+    # beta now scales I (fit_mi_mj's mj seed is beta*I, not a flat constant),
+    # so it plays the same role as alpha and needs the same seed range.
+    seeds = [(a, b) for a in (1.0, 10.0, 50.0, 310.0, 1000.0) for b in (1.0, 10.0, 50.0, 310.0, 1000.0)]
+    best = _fit(df_real_g, omega, I_omega, n_p, seeds, use_gamma=False, weights=None, i=i, j=j)
     return float(best.x[0]), float(best.x[1]), float(best.fun)
 
 
-def fit_alpha_beta_weighted(df_real_g, omega, I_omega, n_p, p_weight_exp=0.5):
+def fit_alpha_beta_weighted(df_real_g, omega, I_omega, n_p, p_weight_exp=0.5, i=1, j=2):
     """Option D: (alpha, beta) under the per-P weight ``(1/RMS_P) * P**p_weight_exp``.
 
     Same 2-parameter ansatz as ``fit_alpha_beta`` -- only the objective weighting
     changes, so this shows how far re-weighting alone can shift the fit toward
-    high P.
+    high P. ``i, j`` (default 1, 2) -- the directly-fit momentum pair.
     """
     weights = _p_weights(df_real_g, p_weight_exp)
-    seeds = [(a, b) for a in (1.0, 10.0, 50.0, 310.0, 1000.0) for b in (-0.1, 0.0, 0.1)]
-    best = _fit(df_real_g, omega, I_omega, n_p, seeds, use_gamma=False, weights=weights)
+    seeds = [(a, b) for a in (1.0, 10.0, 50.0, 310.0, 1000.0) for b in (1.0, 10.0, 50.0, 310.0, 1000.0)]
+    best = _fit(df_real_g, omega, I_omega, n_p, seeds, use_gamma=False, weights=weights, i=i, j=j)
     return float(best.x[0]), float(best.x[1]), float(best.fun)
 
 
-def fit_alpha_beta_gamma(df_real_g, omega, I_omega, n_p, p_weight_exp=0.0):
+def fit_alpha_beta_monotonic(df_real_g, omega, I_omega, n_p, p_weight_exp=0.5, monotonic_penalty=200.0,
+                              i=1, j=2):
+    """(alpha, beta) minimising the P-weighted L1 error subject to a strict
+    best-fit-at-highest-P ordering (see ``_fit``'s ``monotonic_penalty``).
+
+    ``i, j`` (default 1, 2) -- the directly-fit momentum pair. P-weighting
+    alone (``fit_alpha_beta_weighted``) shifts the P=i-vs-P=j balance but
+    does not reliably make the rest of the P's relative error decrease
+    monotonically -- empirically it can go either way depending on alpha's
+    scale, since those moments are a fixed function of mi/I with no
+    separate free parameter. This adds an explicit penalty for any ordering
+    violation so the search is pushed toward a genuinely monotonic fit.
+    """
+    weights = _p_weights(df_real_g, p_weight_exp)
+    seeds = [(a, b) for a in (1.0, 5.0, 10.0, 20.0, 50.0, 100.0)
+             for b in (-50.0, -20.0, -5.0, 0.0, 5.0, 20.0, 50.0)]
+    best = _fit(df_real_g, omega, I_omega, n_p, seeds, use_gamma=False, weights=weights,
+                monotonic_penalty=monotonic_penalty, i=i, j=j)
+    return float(best.x[0]), float(best.x[1]), float(best.fun)
+
+
+def fit_alpha_beta_gamma(df_real_g, omega, I_omega, n_p, p_weight_exp=0.0, i=1, j=2):
     """Option A: (alpha, beta, gamma) with the high-P damping term in ``estimate_M``.
 
     Uses the per-P weight (default exp=0, i.e. 1/RMS_P) so gamma is driven by the
-    high-P shape rather than swamped by the large P=1 residuals.
+    high-P shape rather than swamped by the large P=i residuals. ``i, j``
+    (default 1, 2) -- the directly-fit momentum pair.
     """
     weights = _p_weights(df_real_g, p_weight_exp)
-    seeds = [(a, b, g) for a in (10.0, 50.0, 300.0) for b in (0.0, 0.5) for g in (0.0, 0.3, 0.8)]
-    best = _fit(df_real_g, omega, I_omega, n_p, seeds, use_gamma=True, weights=weights)
+    seeds = [(a, b, g) for a in (10.0, 50.0, 300.0) for b in (10.0, 50.0, 300.0) for g in (0.0, 0.3, 0.8)]
+    best = _fit(df_real_g, omega, I_omega, n_p, seeds, use_gamma=True, weights=weights, i=i, j=j)
     return float(best.x[0]), float(best.x[1]), float(best.x[2]), float(best.fun)
 
 
@@ -380,12 +487,40 @@ def plot_real_vs_synthetic(df_g, est_full, fm, alpha, beta, full_range=False, ga
     plt.close(fig)
 
 
-def generate_m_omega_from_I_omega(fit_method='gamma', p_weight_exp=0.5):
+def generate_m_omega_from_I_omega(fit_method='baseline', p_weight_exp=0.5, monotonic_penalty=200.0,
+                                  i=1, j=2):
     """Fit per FM and write the generated M(omega) tables/plots.
+
+    ``i, j`` (default 1, 2, ``j>i>=1``) -- the directly-fit momentum pair for
+    every FM (see ``estimate_M``); every other P's moment is derived from it.
 
     ``fit_method`` -- ``'baseline'`` (unweighted (alpha, beta), option in
     ``fit_alpha_beta``), ``'weighted'`` (option D -- per-P weighting, uses
-    ``p_weight_exp``) or ``'gamma'`` (option A -- adds the high-P damping term).
+    ``p_weight_exp``), ``'monotonic'`` (``'weighted'`` plus an explicit penalty
+    enforcing a strict best-at-highest-P fit ordering, ``fit_alpha_beta_monotonic``)
+    or ``'gamma'`` (option A -- adds the high-P damping term).
+
+    All keep ``gamma=0`` for the *derived* (P not in {i, j}) moments except
+    ``'gamma'`` itself: with gamma=0, every derived moment is exactly
+    m_k = ((k^2-i^2)*I + i^2*mi) / k^2, the algebraic inverse of
+    I = (k^2*m_k - i^2*mi)/(k^2-i^2) for *every* k -- so any two P's
+    reconstruct the *same* I(omega) (same value, same sign as the fitted
+    curve), which is a physical requirement (I(omega) must not depend on
+    which momentum pair estimated it). ``fit_method='gamma'`` damps the
+    derived moments to better match the real per-P M magnitude (see
+    ``estimate_M``), but that damping breaks this cross-pair consistency for
+    every pair except (i, j) -- use it only for the ``diagnose_fit_methods``
+    comparison, not for ``new_M.csv``.
+
+    Default is ``'baseline'``. ``'weighted'`` (and, more aggressively,
+    ``'monotonic'``) exist to prioritise higher-P fit quality over P=i, but
+    for the (i, j) = (1, 2) default, 2 of this repo's 3 ensembles (FM=12,
+    FM=15) push the 2-free-parameter (alpha, beta) search into a
+    *degenerate* region where the whole P=1 curve (and sometimes others too)
+    flips to M <= 0 everywhere -- e.g. FM=12 weighted: P=1 in [-0.70, 0.0],
+    153% relative error -- rather than genuinely fitting P=1 worse while
+    staying physical. Verify ``new_M.csv``'s per-P min isn't unexpectedly
+    <= 0 before using either.
     """
     df_I = pd.read_csv(os.path.join(DATA_DIR, 'ITD-pol-fit1-line.txt'), header=None, sep=' ')
     df_I.columns = ['W', 'I']
@@ -405,18 +540,21 @@ def generate_m_omega_from_I_omega(fit_method='gamma', p_weight_exp=0.5):
 
         gamma = 0.0
         if fit_method == 'gamma':
-            alpha, beta, gamma, obj = fit_alpha_beta_gamma(df_g, omega, I_omega, n_p)
+            alpha, beta, gamma, obj = fit_alpha_beta_gamma(df_g, omega, I_omega, n_p, i=i, j=j)
+        elif fit_method == 'monotonic':
+            alpha, beta, obj = fit_alpha_beta_monotonic(df_g, omega, I_omega, n_p, p_weight_exp,
+                                                         monotonic_penalty, i=i, j=j)
         elif fit_method == 'weighted':
-            alpha, beta, obj = fit_alpha_beta_weighted(df_g, omega, I_omega, n_p, p_weight_exp)
+            alpha, beta, obj = fit_alpha_beta_weighted(df_g, omega, I_omega, n_p, p_weight_exp, i=i, j=j)
         else:
-            alpha, beta, obj = fit_alpha_beta(df_g, omega, I_omega, n_p)
+            alpha, beta, obj = fit_alpha_beta(df_g, omega, I_omega, n_p, i=i, j=j)
 
-        # per-epoch loss trace for the m1/m2 gradient descent
-        m1, m2, df_loss = fit_m1_m2(I_omega, alpha, beta, record_loss=True, omega=omega)
+        # per-epoch loss trace for the mi/mj gradient descent
+        mi, mj, df_loss = fit_mi_mj(I_omega, alpha, beta, i, j, record_loss=True, omega=omega)
         df_loss.to_csv(os.path.join(DATA_DIR, f'loss_val_FM_{fm}.csv'), index=False)
 
         # real-vs-estimated comparison uses only the matched (sparse) omega grid
-        est = estimate_M(omega, I_omega, n_p, alpha, beta, gamma)
+        est = estimate_M(omega, I_omega, n_p, alpha, beta, gamma, i=i, j=j)
         df_cmp = pd.merge(df_g, est, on=['P', 'Wkey'], how='inner', suffixes=('', '_est'))
         df_cmp = df_cmp[['P', 'W', 'Mean_M', 'Est_M']].sort_values(['P', 'W'])
 
@@ -424,7 +562,7 @@ def generate_m_omega_from_I_omega(fit_method='gamma', p_weight_exp=0.5):
 
         # new_M is evaluated on the full ITD omega grid (0..20), not just the
         # sparse real grid used for fitting.
-        est_full = estimate_M(df_I['W'].values, df_I['I'].values, n_p, alpha, beta, gamma)
+        est_full = estimate_M(df_I['W'].values, df_I['I'].values, n_p, alpha, beta, gamma, i=i, j=j)
         new_M = est_full[['P', 'W', 'Est_M']].copy()
         new_M['FM'] = fm
         all_new_M.append(new_M)
@@ -1008,6 +1146,7 @@ def generate_synthetic_exp_data(new_M_S=None, N_fm=None, seed=12345):
     rng = np.random.default_rng(seed)
     parts = []
     for fm, g in new_M_S.groupby('FM'):
+        g = g.reset_index(drop=True)   # so positions below index straight into `samples`
         n = int(N_fm[fm])
         mu = g['Est_M'].to_numpy(dtype=float)
         sigma = g['Est_S'].to_numpy(dtype=float)
@@ -1023,6 +1162,17 @@ def generate_synthetic_exp_data(new_M_S=None, N_fm=None, seed=12345):
                                        size=(len(g), n), random_state=rng)
         samples = np.where(sigma[:, None] > 0, samples, mu[:, None])
 
+        # Smooth each replica's own M(omega) trajectory along the W grid --
+        # NOT samples.ravel(), which interleaves Exp fastest and would smooth
+        # across unrelated i.i.d. replicas of the same (P,W) point (and bleed
+        # across (P,W) block boundaries) instead of along omega. `g` is
+        # sorted P-then-W (new_M_S's sort order), so each P's rows are
+        # contiguous; smoothing axis=0 within a block smooths each column
+        # (one Exp replica) down that P's W-ordered curve.
+        smoothed = np.empty_like(samples)
+        for _, idx in g.groupby('P').indices.items():
+            smoothed[idx, :] = np.apply_along_axis(get_smooth_curve, 0, samples[idx, :])
+
         parts.append(pd.DataFrame({
             'FM': np.repeat(g['FM'].to_numpy(), n),
             'W': np.repeat(g['W'].to_numpy(), n),
@@ -1030,10 +1180,11 @@ def generate_synthetic_exp_data(new_M_S=None, N_fm=None, seed=12345):
             'Est_M': np.repeat(mu, n),
             'Est_S': np.repeat(sigma, n),
             'Exp': np.tile(np.arange(n), len(g)),
-            'M': samples.ravel(),
+            'M': smoothed.ravel(),
         }))
 
     out = pd.concat(parts, ignore_index=True)
+    out.loc[out.W==0.0, 'M'] = 0.0
     out.to_csv(os.path.join(DATA_DIR, 'generated_Synthetic_exp_data.csv'), index=False)
     return out
 
@@ -1056,7 +1207,12 @@ if __name__ == '__main__':
         data = create_combined_data()
         plot_p_w_m_curves(data)
 
-    generate_m_omega_from_I_omega()
+    # baseline (gamma=0, so new_M.csv's derived moments stay exactly
+    # cross-pair consistent) -- see generate_m_omega_from_I_omega's docstring
+    # for why 'weighted'/'monotonic' (meant to prioritise higher P) aren't
+    # the default: both produce a degenerate (M<=0 everywhere) P=1 curve for
+    # FM=12/15 here.
+    generate_m_omega_from_I_omega(fit_method='baseline')
     diagnose_fit_methods()
     find_distribution_of_real_data()
     check_M_distribution()

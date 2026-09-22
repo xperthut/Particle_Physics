@@ -23,3 +23,13 @@ python train.py --fm 9 --with_exp_id 'Yes' --model_type 'XGB'
 # slowest model type (sequential boosting, no internal parallelism) --
 # lower --n_iter/--search_sample_size for it first if it's too slow, e.g.:
 #   python train.py --fm 9 --with_exp_id 'Yes' --model_type 'GB' --n_iter 10 --search_sample_size 10000
+
+
+# Execution order
+1. synthetic_data_generation.py
+2. prepare_train_test_data.py
+3. train.py --with_exp_id Yes
+4. train.py --with_exp_id No
+5. reconstruct_real_data.py --exp_id 'Yes'
+6. train_error.py
+7. test_error.py
