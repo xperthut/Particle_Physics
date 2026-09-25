@@ -19,6 +19,7 @@ Two stages, both per lattice ensemble (``FM`` = 09 / 12 / 15):
 Run with ``Helicity/Code`` as the working directory:  ``python synthetic_data_generator.py``
 """
 
+import argparse
 import os
 import warnings
 
@@ -442,12 +443,14 @@ def plot_real_vs_synthetic_combined(df_g, est_full, fm, alpha, beta, full_range=
     plt.close()
 
 
-def plot_real_vs_synthetic(df_g, est_full, fm, alpha, beta, full_range=False, gamma=0.0):
+def plot_real_vs_synthetic(df_g, est_full, fm, alpha, beta, full_range=False, gamma=0.0, tag=''):
     """One panel per P: real mean M (+/- std) points vs the synthetic M(omega) curve.
 
     ``df_g``     -- real_mean_M() output for this ensemble (sparse omega grid).
     ``est_full`` -- estimate_M() output on the full ITD omega grid (0..20).
     ``full_range`` -- if True show omega up to 20, else zoom to the real data range.
+    ``tag`` is appended to the output filename (e.g. a fit-method label), same as
+    ``plot_real_vs_synthetic_combined``.
     """
     all_p = sorted(df_g.P.unique())
     ncols = 3
@@ -482,7 +485,7 @@ def plot_real_vs_synthetic(df_g, est_full, fm, alpha, beta, full_range=False, ga
     fig.suptitle(_fit_title(fm, alpha, beta, gamma))
     fig.tight_layout()
     suffix = '_full' if full_range else ''
-    fig.savefig(os.path.join(IMG_DIR, f'M_real_vs_synthetic_FM_{fm}{suffix}.pdf'),
+    fig.savefig(os.path.join(IMG_DIR, f'M_real_vs_synthetic_FM_{fm}{tag}{suffix}.pdf'),
                 format='pdf', dpi=300)
     plt.close(fig)
 
@@ -594,6 +597,70 @@ def _per_p_rel_rms(df_real_g, est):
         denom = np.sqrt(np.mean(t.Mean_M ** 2)) or np.nan
         out[int(p)] = float(np.sqrt(np.mean((t.Mean_M - t.Est_M) ** 2)) / denom)
     return out
+
+
+def preview_alpha_beta(fm, alpha, beta, gamma=0.0, i=1, j=2, tag='_manual'):
+    """Hand-tune (alpha, beta[, gamma]) for one FM and see the effect immediately.
+
+    Skips ``create_combined_data`` and the ``fit_alpha_beta*`` search entirely --
+    it just reloads ``All_p_w_m.csv``/``ITD-pol-fit1-line.txt`` (already on disk
+    after one run of ``generate_m_omega_from_I_omega``), builds ``estimate_M`` at
+    the values you pass in, prints the per-P fit quality, and rewrites
+    ``M_real_vs_synthetic*_FM_{fm}{tag}*.pdf`` (``tag`` defaults to ``'_manual'``
+    so these never overwrite the pipeline's own ``M_real_vs_synthetic*_FM_{fm}.pdf``
+    from ``generate_m_omega_from_I_omega``/``new_M.csv``). Call it repeatedly --
+    e.g. from a notebook/REPL -- with different alpha/beta until P=1..4 line up
+    well enough; nothing here writes ``new_M.csv`` or ``optimal_alpha_beta.csv``,
+    so it's safe to explore without disturbing the pipeline's saved fit.
+
+    Only ``mi``/``mj`` (P = i, j; default 1, 2) are direct functions of
+    alpha/beta -- every other P (including P=3, 4) is the closed-form derived
+    moment from ``estimate_M``, so alpha/beta move P=3..5 only indirectly
+    through mi/I; ``gamma`` (default 0, i.e. off) is the other knob available,
+    damping just the derived moments -- see ``estimate_M``'s docstring.
+
+    Returns ``(df_cmp, per_p)``: the matched real-vs-estimated rows (as
+    ``generate_m_omega_from_I_omega`` writes to ``M_real_vs_est_FM_{fm}.csv``)
+    and a per-P DataFrame of ``mean_abs_diff`` / ``rel_rms_pct`` / ``n`` so you
+    can compare candidates numerically, not just by eyeballing the plots.
+    """
+    df_I = pd.read_csv(os.path.join(DATA_DIR, 'ITD-pol-fit1-line.txt'), header=None, sep=' ')
+    df_I.columns = ['W', 'I']
+
+    data = pd.read_csv(os.path.join(DATA_DIR, 'All_p_w_m.csv'))
+    df_g = real_mean_M(data, fm)
+    n_p = int(df_g.P.nunique())
+
+    omega = np.sort(df_g['W'].unique())
+    I_omega = np.interp(omega, df_I['W'].values, df_I['I'].values)
+
+    est = estimate_M(omega, I_omega, n_p, alpha, beta, gamma, i=i, j=j)
+    df_cmp = pd.merge(df_g, est, on=['P', 'Wkey'], how='inner', suffixes=('', '_est'))
+    df_cmp = df_cmp[['P', 'W', 'Mean_M', 'Est_M']].sort_values(['P', 'W'])
+
+    rel_rms = _per_p_rel_rms(df_g, est)
+    rows = []
+    for p in sorted(df_cmp.P.unique()):
+        d = df_cmp[df_cmp.P == p]
+        rows.append({
+            'P': int(p),
+            'mean_abs_diff': float(np.abs(d['Mean_M'] - d['Est_M']).mean()),
+            'rel_rms_pct': 100.0 * rel_rms.get(int(p), np.nan),
+            'n': len(d),
+        })
+    per_p = pd.DataFrame(rows).set_index('P')
+
+    print(f'FM={fm}  alpha={alpha:.5g}  beta={beta:.5g}  gamma={gamma:.5g}')
+    print(per_p.to_string(float_format=lambda x: f'{x:.4g}'))
+
+    est_full = estimate_M(df_I['W'].values, df_I['I'].values, n_p, alpha, beta, gamma, i=i, j=j)
+
+    plot_real_vs_synthetic(df_g, est_full, fm, alpha, beta, gamma=gamma, tag=tag)
+    plot_real_vs_synthetic(df_g, est_full, fm, alpha, beta, full_range=True, gamma=gamma, tag=tag)
+    plot_real_vs_synthetic_combined(df_g, est_full, fm, alpha, beta, gamma=gamma, tag=tag)
+    plot_real_vs_synthetic_combined(df_g, est_full, fm, alpha, beta, full_range=True, gamma=gamma, tag=tag)
+
+    return df_cmp, per_p
 
 
 def diagnose_fit_methods():
@@ -1202,25 +1269,54 @@ def generate_m_omega_from_distribution():
     generate_synthetic_exp_data(new_M_S, N_fm)
 
 
-if __name__ == '__main__':
-    if not os.path.exists(os.path.join(DATA_DIR, 'All_p_w_m.csv')):
-        data = create_combined_data()
-        plot_p_w_m_curves(data)
+def _parse_args():
+    parser = argparse.ArgumentParser(
+        description='Default (no arguments): run the full synthetic-data pipeline '
+                    '(fit alpha/beta per FM and generate everything downstream of it). '
+                    'Pass --fm together with --alpha/--beta to instead preview a '
+                    'hand-picked fit for that one FM via preview_alpha_beta, without '
+                    'touching new_M.csv or optimal_alpha_beta.csv.')
+    parser.add_argument('--fm', type=int, default=None,
+                        help='Ensemble id (e.g. 9, 12, 15). Requires --alpha and --beta.')
+    parser.add_argument('--alpha', type=float, default=None, help='alpha to preview for --fm.')
+    parser.add_argument('--beta', type=float, default=None, help='beta to preview for --fm.')
+    parser.add_argument('--gamma', type=float, default=0.0,
+                        help='Optional high-P damping term (see estimate_M). Default 0 (off).')
+    parser.add_argument('--i', type=int, default=1, help='Lower momentum of the directly-fit pair.')
+    parser.add_argument('--j', type=int, default=2, help='Higher momentum of the directly-fit pair.')
+    parser.add_argument('--tag', default='_manual',
+                        help="Suffix for the preview plot filenames, so they don't overwrite "
+                             "the pipeline's own M_real_vs_synthetic*_FM_{fm}.pdf.")
+    return parser.parse_args()
 
-    # baseline (gamma=0, so new_M.csv's derived moments stay exactly
-    # cross-pair consistent) -- see generate_m_omega_from_I_omega's docstring
-    # for why 'weighted'/'monotonic' (meant to prioritise higher P) aren't
-    # the default: both produce a degenerate (M<=0 everywhere) P=1 curve for
-    # FM=12/15 here.
-    generate_m_omega_from_I_omega(fit_method='baseline')
-    diagnose_fit_methods()
-    find_distribution_of_real_data()
-    check_M_distribution()
-    #plot_mean_vs_median()
-    #plot_qq_normal()
-    #plot_skew_kurtosis()
-    check_linearity()
-    plot_mean_vs_w()
-    plot_std_vs_w()
-    plot_mean_median_and_qq()
-    generate_m_omega_from_distribution()
+
+if __name__ == '__main__':
+    args = _parse_args()
+
+    if args.fm is not None or args.alpha is not None or args.beta is not None:
+        if args.fm is None or args.alpha is None or args.beta is None:
+            raise SystemExit('--fm, --alpha and --beta must all be given together.')
+        preview_alpha_beta(args.fm, args.alpha, args.beta, gamma=args.gamma,
+                           i=args.i, j=args.j, tag=args.tag)
+    else:
+        if not os.path.exists(os.path.join(DATA_DIR, 'All_p_w_m.csv')):
+            data = create_combined_data()
+            plot_p_w_m_curves(data)
+
+        # baseline (gamma=0, so new_M.csv's derived moments stay exactly
+        # cross-pair consistent) -- see generate_m_omega_from_I_omega's docstring
+        # for why 'weighted'/'monotonic' (meant to prioritise higher P) aren't
+        # the default: both produce a degenerate (M<=0 everywhere) P=1 curve for
+        # FM=12/15 here.
+        generate_m_omega_from_I_omega(fit_method='baseline')
+        diagnose_fit_methods()
+        find_distribution_of_real_data()
+        check_M_distribution()
+        #plot_mean_vs_median()
+        #plot_qq_normal()
+        #plot_skew_kurtosis()
+        check_linearity()
+        plot_mean_vs_w()
+        plot_std_vs_w()
+        plot_mean_median_and_qq()
+        generate_m_omega_from_distribution()
