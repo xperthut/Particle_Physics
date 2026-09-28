@@ -9,19 +9,15 @@ each with columns  FM, P, Exp, W, anchored, M_GB, M_RF, M_XGB.  This script
 processes every such file it finds and, per (variant, FM):
 
   * averages each model's M over the Exp replicas -> Mean_M_* / Std_M_* per (P, W);
-  * combines two momenta into the Ioffe-time distribution
+  * combines every momentum pair (p1 < p2) into an Ioffe-time estimate
         I(w) = (p2^2 * M(p2, w) - p1^2 * M(p1, w)) / (p2^2 - p1^2)
-    on the Exp-averaged mean curve.
-
-    The pair is referenced to P=1 (default p1=1, p2=2): this is the exact
-    inverse of how synthetic_data_generator.py *defines* I(w),
-        I = (4*M2 - M1) / 3          (A=-1/3, B=4/3 in that file)
-    and generally  I = (k^2 * M_k - M1) / (k^2 - 1)  for the derived moments.
-    A pair that excludes P=1 (e.g. 2,3) is inconsistent with that definition
-    and gives a sign-flipped curve.
+    on the Exp-averaged mean curve, then averages the non-negative pair
+    estimates at each w (0 where every pair is negative).  With gamma=0,
+    synthetic_data_generator.py derives every M_k so that any pair inverts
+    to the same I(w).
 
   * smooths I(w) with a Savitzky-Golay filter (order-3 polynomial over a
-    sliding window; --smooth_window points, default 25 = 2.5 in omega).
+    sliding window; --smooth_window points, default 60 -> 59 = 5.9 in omega).
     Savitzky-Golay keeps the single hump / peak position that a plain moving
     average (the old seasonal_decompose trend) rounded off, while removing the
     step artefacts the autoregressive roll leaves in the extrapolated tail.
@@ -70,7 +66,9 @@ def get_smooth_curve(val, window=SMOOTH_WINDOW, polyorder=SMOOTH_POLYORDER):
     """
     val = np.asarray(val, dtype=float)
     n = val.size
-    w = min(int(window), n if n % 2 == 1 else n - 1)
+    w = min(int(window), n)
+    if w % 2 == 0:
+        w -= 1
     if w <= polyorder or w < 5:
         return val
     return savgol_filter(val, window_length=w, polyorder=polyorder, mode='interp')
@@ -85,10 +83,8 @@ def get_mean_std(data, grp_cols, agg_col):
 
 
 class Test_Error:
-    def __init__(self, data_dir='../Data/2026', p1=1, p2=2, smooth_window=SMOOTH_WINDOW):
+    def __init__(self, data_dir='../Data/2026', smooth_window=SMOOTH_WINDOW):
         self.data_dir = data_dir
-        self.p1 = p1
-        self.p2 = p2
         self.smooth_window = smooth_window
         self.img_dir = os.path.join(data_dir, 'Images')
 
@@ -109,28 +105,51 @@ class Test_Error:
             df = part if df is None else df.merge(part, on=['P', 'W'])
         return df
 
+    @staticmethod
+    def _I_omega(piv, p1, p2):
+        """('p1-p2', I(w) array) from one momentum pair of the pivot (index W, columns P)."""
+        denom = p2 ** 2 - p1 ** 2
+        col = f'{p1}-{p2}'
+        vals = ((p2 ** 2 * piv[p2] - p1 ** 2 * piv[p1]) / denom).to_numpy()
+        return col, vals
+
     def _compute_I(self, df_ms):
-        """I(w) + smoothed I(w) from the (p1, p2) momentum pair."""
-        p1, p2 = self.p1, self.p2
-        present = set(df_ms.P.unique())
-        if not {p1, p2} <= present:
-            print(f'  P pair ({p1}, {p2}) not both present in {sorted(present)}; '
-                  f'skipping I(omega)')
+        """I(w) averaged over every (i<j) momentum pair, + smoothed I(w).
+
+        At each W only the non-negative pair estimates enter the mean; if every
+        pair is negative there, I(w) is set to 0 (I is physically non-negative).
+        """
+        present = sorted(df_ms.P.unique())
+        if len(present) < 2:
+            print(f'  need at least two P values, have {present}; skipping I(omega)')
             return None
 
-        denom = p2 ** 2 - p1 ** 2
         rows = {}
         piv = None
         for name in MODEL_NAMES:
             piv = (df_ms.pivot_table(index='W', columns='P', values=f'Mean_M_{name}')
                    .sort_index())
-            rows[f'I_{name}'] = ((p2 ** 2 * piv[p2] - p1 ** 2 * piv[p1]) / denom).to_numpy()
+            tmp = {}
+            for i in present:
+                for j in present:
+                    if i < j:
+                        c, v = self._I_omega(piv, i, j)
+                        tmp[c] = v
+            tmp = pd.DataFrame(tmp, index=piv.index)
+            rows[f'I_{name}'] = tmp.where(tmp >= 0).mean(axis=1).fillna(0.0).to_numpy()
         rows['W'] = np.round(piv.index.to_numpy(), W_DECIMALS)
 
         df_I = pd.DataFrame(rows).sort_values('W').reset_index(drop=True)
         for name in MODEL_NAMES:
             sm = get_smooth_curve(df_I[f'I_{name}'], self.smooth_window)
             sm = np.where(df_I['W'].to_numpy() == 0.0, 0.0, sm)   # I(0) = 0 exactly
+            # I(omega) is physically non-negative everywhere; the raw combination
+            # can dip slightly below 0 at small omega (real M is noisiest there,
+            # e.g. one anchored point sized to fit its own P but not the other's),
+            # and the Savitzky-Golay window then smears that dip into a visible
+            # negative glitch just past omega=0. Floor the *smoothed* curve only
+            # -- the raw I_* columns keep the unclipped values for diagnostics.
+            sm = np.clip(sm, 0.0, None)
             df_I[f'smooth_I{name}'] = sm
         return df_I[['W'] + [f'I_{n}' for n in MODEL_NAMES]
                     + [f'smooth_I{n}' for n in MODEL_NAMES]]
@@ -139,7 +158,7 @@ class Test_Error:
         ordered_ps = sorted(df_ms.P.unique())
         colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
         n_rows = 2 if df_I is not None else 1
-        fig, axes = plt.subplots(n_rows, 3, figsize=(24, 9 * n_rows), dpi=150,
+        fig, axes = plt.subplots(n_rows, 3, figsize=(24, 9 * n_rows), dpi=330,
                                  squeeze=False)
 
         for col, name in enumerate(MODEL_NAMES):
@@ -172,11 +191,11 @@ class Test_Error:
         anchor_note = (f'   (real data anchors $\\omega\\leq${w_anchor:.1f}, '
                        f'dashed line; beyond is extrapolation)' if w_anchor else '')
         fig.suptitle(f'FM={fm}  [{VARIANT_TITLE.get(variant, variant)}]   '
-                     f'I($\\omega$) from $p_z$=({self.p1}, {self.p2}){anchor_note}')
+                     f'I($\\omega$) averaged over all $p_z$ pairs{anchor_note}')
         fig.tight_layout()
         os.makedirs(self.img_dir, exist_ok=True)
         out_png = os.path.join(self.img_dir, f'projected_I_{variant}_{fm}.png')
-        fig.savefig(out_png)
+        fig.savefig(out_png, dpi=330)
         plt.close(fig)
         print(f'  plot -> {out_png}')
 
@@ -198,7 +217,7 @@ class Test_Error:
 
             w_anchor = 0.0
             if 'anchored' in data.columns:
-                anch = data[(data.anchored == 1) & data.P.isin([self.p1, self.p2])]
+                anch = data[data.anchored == 1]
                 w_anchor = float(anch.W.max()) if not anch.empty else 0.0
 
             ms_out = os.path.join(self.data_dir, f'Projected_M_mean_std_{variant}_{fm}.csv')
@@ -217,13 +236,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", default='../Data/2026',
                         help="Directory holding Real_data_projected_{fm}_{variant}_v2.csv")
-    parser.add_argument("--p1", type=int, default=1,
-                        help="reference momentum of the I(omega) pair (keep at 1)")
-    parser.add_argument("--p2", type=int, default=2,
-                        help="second momentum of the I(omega) pair (2 = exact; k>=3 has gamma damping)")
     parser.add_argument("--smooth_window", type=int, default=SMOOTH_WINDOW,
                         help="Savitzky-Golay window in omega-grid points (odd; larger = smoother)")
     args = parser.parse_args()
 
-    Test_Error(data_dir=args.data_dir, p1=args.p1, p2=args.p2,
-               smooth_window=args.smooth_window).run()
+    Test_Error(data_dir=args.data_dir, smooth_window=args.smooth_window).run()

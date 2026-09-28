@@ -140,4 +140,4 @@ Plotter.Plot.legend([(p4[-1], p44[0])], [ r' $\mathit{\Delta \mathfrak{M}_g(\ome
 
 
 
-Plotter.save("DeltaMg-XGB.pdf");
+Plotter.save("DeltaMg-XGB.png");

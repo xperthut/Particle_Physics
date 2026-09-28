@@ -112,4 +112,4 @@ Plotter.Plot.legend([(p3[-1], p33[0]), (p2[-1], p22[0]), (p4[-1], p44[0])], [ r'
 
 
 
-Plotter.save("DeltaIg-ML-NNPDF_SYS.pdf");
+Plotter.save("DeltaIg-ML-NNPDF_SYS.png");

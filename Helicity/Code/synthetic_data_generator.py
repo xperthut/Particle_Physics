@@ -40,9 +40,29 @@ mpl.rcParams.update({'font.size': 22})
 SMOOTH_WINDOW = 60       # Savitzky-Golay window in grid points (0.1 each)
 SMOOTH_POLYORDER = 3
 
+PLOT_DPI = 330           # all figures are saved as PNG at this resolution
+
 VERSION = 2026
 DATA_DIR = f'../Data/{VERSION}/'
 IMG_DIR = f'../Data/{VERSION}/Images/'
+
+abg_config = {
+    '09':{
+        'alpha': 55.0,
+        'beta': -6.0,
+        'gamma': 0.0,
+    },
+    '12':{
+            'alpha': 20.0,
+            'beta': 40.0,
+            'gamma': 0.0,
+        },
+    '15':{
+            'alpha': 2.0,
+            'beta': 50.0,
+            'gamma': 0.0,
+        },
+}
 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(IMG_DIR, exist_ok=True)
@@ -141,7 +161,7 @@ def plot_p_w_m_curves(data=None):
     for fm in data['FM'].unique():
         df_g = real_mean_M(data, fm)
 
-        plt.figure(dpi=300)
+        plt.figure(dpi=PLOT_DPI)
         for p in sorted(df_g.P.unique()):
             t = df_g[df_g.P == p]
             plt.plot(t.W, t.Mean_M, '-o', label=fr"$p_z$={p}")
@@ -150,16 +170,16 @@ def plot_p_w_m_curves(data=None):
         plt.ylabel(r'$\Delta\mathfrak{M}(\omega)$')
         plt.title(f'FM={fm}')
         plt.legend()
-        plt.savefig(os.path.join(IMG_DIR, f'P_W_M_curves_FM_{fm}.pdf'), format='pdf', dpi=300)
+        plt.savefig(os.path.join(IMG_DIR, f'P_W_M_curves_FM_{fm}.png'), format='png', dpi=PLOT_DPI)
         plt.close()
 
 
 def plot_I_omega(df_I):
-    plt.figure(dpi=300)
+    plt.figure(dpi=PLOT_DPI)
     plt.plot(df_I.W, df_I.I, '-o')
     plt.xlabel(r'$\omega$')
     plt.ylabel(r'$\Delta \mathcal{I}(\omega)$')
-    plt.savefig(os.path.join(IMG_DIR, 'I(w).pdf'), format='pdf', dpi=300)
+    plt.savefig(os.path.join(IMG_DIR, 'I(w).png'), format='png', dpi=PLOT_DPI)
     plt.close()
 
 
@@ -417,7 +437,7 @@ def plot_real_vs_synthetic_combined(df_g, est_full, fm, alpha, beta, full_range=
     all_p = sorted(df_g.P.unique())
     colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
 
-    plt.figure(dpi=300)
+    plt.figure(dpi=PLOT_DPI)
     w_max = df_g['W'].max()
     for i, p in enumerate(all_p):
         c = colors[i % len(colors)]
@@ -438,8 +458,8 @@ def plot_real_vs_synthetic_combined(df_g, est_full, fm, alpha, beta, full_range=
     plt.title(_fit_title(fm, alpha, beta, gamma))
     plt.legend(fontsize=10, ncol=2)
     suffix = '_full' if full_range else ''
-    plt.savefig(os.path.join(IMG_DIR, f'M_real_vs_synthetic_combined_FM_{fm}{tag}{suffix}.pdf'),
-                format='pdf', dpi=300)
+    plt.savefig(os.path.join(IMG_DIR, f'M_real_vs_synthetic_combined_FM_{fm}{tag}{suffix}.png'),
+                format='png', dpi=PLOT_DPI)
     plt.close()
 
 
@@ -456,7 +476,7 @@ def plot_real_vs_synthetic(df_g, est_full, fm, alpha, beta, full_range=False, ga
     ncols = 3
     nrows = int(np.ceil(len(all_p) / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4.5 * nrows),
-                             dpi=300, squeeze=False)
+                             dpi=PLOT_DPI, squeeze=False)
 
     for ax, p in zip(axes.flat, all_p):
         r = df_g[df_g.P == p].sort_values('W')
@@ -485,51 +505,42 @@ def plot_real_vs_synthetic(df_g, est_full, fm, alpha, beta, full_range=False, ga
     fig.suptitle(_fit_title(fm, alpha, beta, gamma))
     fig.tight_layout()
     suffix = '_full' if full_range else ''
-    fig.savefig(os.path.join(IMG_DIR, f'M_real_vs_synthetic_FM_{fm}{tag}{suffix}.pdf'),
-                format='pdf', dpi=300)
+    fig.savefig(os.path.join(IMG_DIR, f'M_real_vs_synthetic_FM_{fm}{tag}{suffix}.png'),
+                format='png', dpi=PLOT_DPI)
     plt.close(fig)
 
 
-def generate_m_omega_from_I_omega(fit_method='baseline', p_weight_exp=0.5, monotonic_penalty=200.0,
-                                  i=1, j=2):
-    """Fit per FM and write the generated M(omega) tables/plots.
+def generate_m_omega_from_I_omega(i=1, j=2):
+    """Write the generated M(omega) tables/plots per FM, using ``abg_config``.
 
     ``i, j`` (default 1, 2, ``j>i>=1``) -- the directly-fit momentum pair for
     every FM (see ``estimate_M``); every other P's moment is derived from it.
 
-    ``fit_method`` -- ``'baseline'`` (unweighted (alpha, beta), option in
-    ``fit_alpha_beta``), ``'weighted'`` (option D -- per-P weighting, uses
-    ``p_weight_exp``), ``'monotonic'`` (``'weighted'`` plus an explicit penalty
-    enforcing a strict best-at-highest-P fit ordering, ``fit_alpha_beta_monotonic``)
-    or ``'gamma'`` (option A -- adds the high-P damping term).
+    ``alpha``/``beta``/``gamma`` are no longer searched for -- every FM present
+    in ``All_p_w_m.csv`` must have an entry in the module-level ``abg_config``
+    dict (keyed by the zero-padded FM string, e.g. ``'09'``), typically
+    hand-picked with ``preview_alpha_beta``. A FM missing from ``abg_config``
+    raises ``ValueError`` rather than silently fitting one.
 
-    All keep ``gamma=0`` for the *derived* (P not in {i, j}) moments except
-    ``'gamma'`` itself: with gamma=0, every derived moment is exactly
-    m_k = ((k^2-i^2)*I + i^2*mi) / k^2, the algebraic inverse of
-    I = (k^2*m_k - i^2*mi)/(k^2-i^2) for *every* k -- so any two P's
+    With ``gamma=0`` (``abg_config``'s default), every derived (P not in
+    {i, j}) moment is exactly m_k = ((k^2-i^2)*I + i^2*mi) / k^2, the algebraic
+    inverse of I = (k^2*m_k - i^2*mi)/(k^2-i^2) for *every* k -- so any two P's
     reconstruct the *same* I(omega) (same value, same sign as the fitted
     curve), which is a physical requirement (I(omega) must not depend on
-    which momentum pair estimated it). ``fit_method='gamma'`` damps the
-    derived moments to better match the real per-P M magnitude (see
-    ``estimate_M``), but that damping breaks this cross-pair consistency for
-    every pair except (i, j) -- use it only for the ``diagnose_fit_methods``
-    comparison, not for ``new_M.csv``.
-
-    Default is ``'baseline'``. ``'weighted'`` (and, more aggressively,
-    ``'monotonic'``) exist to prioritise higher-P fit quality over P=i, but
-    for the (i, j) = (1, 2) default, 2 of this repo's 3 ensembles (FM=12,
-    FM=15) push the 2-free-parameter (alpha, beta) search into a
-    *degenerate* region where the whole P=1 curve (and sometimes others too)
-    flips to M <= 0 everywhere -- e.g. FM=12 weighted: P=1 in [-0.70, 0.0],
-    153% relative error -- rather than genuinely fitting P=1 worse while
-    staying physical. Verify ``new_M.csv``'s per-P min isn't unexpectedly
-    <= 0 before using either.
+    which momentum pair estimated it). A nonzero ``gamma`` damps the derived
+    moments to better match the real per-P M magnitude (see ``estimate_M``),
+    but breaks this cross-pair consistency for every pair except (i, j).
     """
     df_I = pd.read_csv(os.path.join(DATA_DIR, 'ITD-pol-fit1-line.txt'), header=None, sep=' ')
     df_I.columns = ['W', 'I']
     plot_I_omega(df_I)
 
     data = pd.read_csv(os.path.join(DATA_DIR, 'All_p_w_m.csv'))
+
+    missing = sorted({f'{int(fm):02d}' for fm in data.FM.unique()} - set(abg_config))
+    if missing:
+        raise ValueError(f'abg_config is missing an entry for FM {missing} -- '
+                         'add alpha/beta/gamma for it (see preview_alpha_beta).')
 
     summary = []
     all_new_M = []
@@ -541,16 +552,8 @@ def generate_m_omega_from_I_omega(fit_method='baseline', p_weight_exp=0.5, monot
         omega = np.sort(df_g['W'].unique())
         I_omega = np.interp(omega, df_I['W'].values, df_I['I'].values)
 
-        gamma = 0.0
-        if fit_method == 'gamma':
-            alpha, beta, gamma, obj = fit_alpha_beta_gamma(df_g, omega, I_omega, n_p, i=i, j=j)
-        elif fit_method == 'monotonic':
-            alpha, beta, obj = fit_alpha_beta_monotonic(df_g, omega, I_omega, n_p, p_weight_exp,
-                                                         monotonic_penalty, i=i, j=j)
-        elif fit_method == 'weighted':
-            alpha, beta, obj = fit_alpha_beta_weighted(df_g, omega, I_omega, n_p, p_weight_exp, i=i, j=j)
-        else:
-            alpha, beta, obj = fit_alpha_beta(df_g, omega, I_omega, n_p, i=i, j=j)
+        cfg = abg_config[f'{int(fm):02d}']
+        alpha, beta, gamma = cfg['alpha'], cfg['beta'], cfg.get('gamma', 0.0)
 
         # per-epoch loss trace for the mi/mj gradient descent
         mi, mj, df_loss = fit_mi_mj(I_omega, alpha, beta, i, j, record_loss=True, omega=omega)
@@ -560,6 +563,11 @@ def generate_m_omega_from_I_omega(fit_method='baseline', p_weight_exp=0.5, monot
         est = estimate_M(omega, I_omega, n_p, alpha, beta, gamma, i=i, j=j)
         df_cmp = pd.merge(df_g, est, on=['P', 'Wkey'], how='inner', suffixes=('', '_est'))
         df_cmp = df_cmp[['P', 'W', 'Mean_M', 'Est_M']].sort_values(['P', 'W'])
+
+        # no search objective to report anymore -- the same unweighted metric
+        # fit_alpha_beta used to minimise, kept for a comparable number in the
+        # summary CSV/print below.
+        obj, _ = match_real_and_estimated_M(df_g, est)
 
         df_cmp.to_csv(os.path.join(DATA_DIR, f'M_real_vs_est_FM_{fm}.csv'), index=False)
 
@@ -578,10 +586,10 @@ def generate_m_omega_from_I_omega(fit_method='baseline', p_weight_exp=0.5, monot
         n_matched = len(df_cmp)
         mean_abs = np.abs(df_cmp['Mean_M'] - df_cmp['Est_M']).mean()
         summary.append({
-            'FM': fm, 'fit_method': fit_method, 'alpha': alpha, 'beta': beta, 'gamma': gamma,
+            'FM': fm, 'alpha': alpha, 'beta': beta, 'gamma': gamma,
             'objective': obj, 'n_matched': n_matched, 'mean_abs_diff': mean_abs,
         })
-        print(f'FM={fm}: method={fit_method} alpha={alpha:.5g}, beta={beta:.5g}, '
+        print(f'FM={fm}: alpha={alpha:.5g}, beta={beta:.5g}, '
               f'gamma={gamma:.5g}, mean|dM|={mean_abs:.5g} over {n_matched} points')
 
     pd.concat(all_new_M, ignore_index=True).to_csv(os.path.join(DATA_DIR, 'new_M.csv'), index=False)
@@ -606,8 +614,8 @@ def preview_alpha_beta(fm, alpha, beta, gamma=0.0, i=1, j=2, tag='_manual'):
     it just reloads ``All_p_w_m.csv``/``ITD-pol-fit1-line.txt`` (already on disk
     after one run of ``generate_m_omega_from_I_omega``), builds ``estimate_M`` at
     the values you pass in, prints the per-P fit quality, and rewrites
-    ``M_real_vs_synthetic*_FM_{fm}{tag}*.pdf`` (``tag`` defaults to ``'_manual'``
-    so these never overwrite the pipeline's own ``M_real_vs_synthetic*_FM_{fm}.pdf``
+    ``M_real_vs_synthetic*_FM_{fm}{tag}*.png`` (``tag`` defaults to ``'_manual'``
+    so these never overwrite the pipeline's own ``M_real_vs_synthetic*_FM_{fm}.png``
     from ``generate_m_omega_from_I_omega``/``new_M.csv``). Call it repeatedly --
     e.g. from a notebook/REPL -- with different alpha/beta until P=1..4 line up
     well enough; nothing here writes ``new_M.csv`` or ``optimal_alpha_beta.csv``,
@@ -667,7 +675,14 @@ def diagnose_fit_methods():
     """Compare the baseline fit, option D (re-weighting only) and option A (gamma).
 
     Prints a per-P relative-RMS table per ensemble and writes
-    ``Data/2026/fit_method_comparison.csv``.
+    ``Data/2026/fit_method_comparison.csv`` plus one
+    ``M_real_vs_synthetic_combined_FM_{fm}_{baseline,Dexp*,Agamma}.png`` per FM.
+
+    No longer called from ``__main__`` -- now that ``generate_m_omega_from_I_omega``
+    reads alpha/beta/gamma from ``abg_config`` instead of fitting them, these
+    search-based comparisons aren't part of the regular pipeline run; call this
+    manually (e.g. from a notebook/REPL) if you want to re-run the search anyway,
+    for a new ensemble or to sanity-check an ``abg_config`` value.
     """
     df_I = pd.read_csv(os.path.join(DATA_DIR, 'ITD-pol-fit1-line.txt'), header=None, sep=' ')
     df_I.columns = ['W', 'I']
@@ -819,7 +834,7 @@ def find_distribution_of_real_data(omega_grid='full', seed=12345, make_plots=Tru
         for fm, g in df_chk.groupby('FM'):
             all_p = sorted(g.P.unique())
             fig, axes = plt.subplots(1, len(all_p), figsize=(5 * len(all_p), 4.5),
-                                     dpi=300, squeeze=False)
+                                     dpi=PLOT_DPI, squeeze=False)
             for ax, pp in zip(axes.flat, all_p):
                 tp = g[g.P == pp].sort_values('W')
                 ax.plot(tp.W, tp.std_real, '^', label='real std')
@@ -830,8 +845,8 @@ def find_distribution_of_real_data(omega_grid='full', seed=12345, make_plots=Tru
                 ax.legend(fontsize=10)
             fig.suptitle(f'FM={fm}   real vs modelled Exp-scatter')
             fig.tight_layout()
-            fig.savefig(os.path.join(IMG_DIR, f'real_distribution_FM_{fm}.pdf'),
-                        format='pdf', dpi=300)
+            fig.savefig(os.path.join(IMG_DIR, f'real_distribution_FM_{fm}.png'),
+                        format='png', dpi=PLOT_DPI)
             plt.close(fig)
 
     return df_params
@@ -868,7 +883,7 @@ def _fit_and_score(x, dist):
 
 def _plot_distribution_example(data, fm, p, w, names, tag):
     x = data[(data.FM == fm) & (data.P == p) & np.isclose(data.W, w)]['M'].to_numpy()
-    plt.figure(dpi=300)
+    plt.figure(dpi=PLOT_DPI)
     counts, bins, _ = plt.hist(x, bins=40, density=True, alpha=0.35, color='gray', label='real M')
     grid = np.linspace(bins[0], bins[-1], 400)
     for name in names:
@@ -878,7 +893,7 @@ def _plot_distribution_example(data, fm, p, w, names, tag):
     plt.ylabel('density')
     plt.title(fr'FM={fm} $p_z$={p} $\omega$={w:.3g}  (n={len(x)})')
     plt.legend(fontsize=11)
-    plt.savefig(os.path.join(IMG_DIR, f'M_distribution_example_{tag}.pdf'), format='pdf', dpi=300)
+    plt.savefig(os.path.join(IMG_DIR, f'M_distribution_example_{tag}.png'), format='png', dpi=PLOT_DPI)
     plt.close()
 
 
@@ -1003,30 +1018,30 @@ def _draw_qq_normal(ax, groups, title='qq-normal'):
 
 
 def plot_mean_vs_median(data=None):
-    plt.figure(dpi=300)
+    plt.figure(dpi=PLOT_DPI)
     _draw_mean_vs_median(plt.gca(), _real_groups(data), title='mean vs median of M, per (FM, P, W)')
-    plt.savefig(os.path.join(IMG_DIR, 'mean_vs_median.pdf'), format='pdf', dpi=300)
+    plt.savefig(os.path.join(IMG_DIR, 'mean_vs_median.png'), format='png', dpi=PLOT_DPI)
     plt.close()
 
 
 def plot_qq_normal(data=None):
     groups = _real_groups(data)
-    plt.figure(dpi=300)
+    plt.figure(dpi=PLOT_DPI)
     _draw_qq_normal(plt.gca(), groups,
                     title=f'Normal Q-Q plot, standardised M  '
                           f'({sum(len(x) for x in groups.values())} points pooled over all (FM,P,W))')
-    plt.savefig(os.path.join(IMG_DIR, 'qq_normal_pooled.pdf'), format='pdf', dpi=300)
+    plt.savefig(os.path.join(IMG_DIR, 'qq_normal_pooled.png'), format='png', dpi=PLOT_DPI)
     plt.close()
 
 
 def plot_mean_median_and_qq(data=None):
     """Mean-vs-median and the normal Q-Q plot side by side in one figure."""
     groups = _real_groups(data)
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5.5), dpi=300)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5.5), dpi=PLOT_DPI)
     _draw_mean_vs_median(ax1, groups, title='mean vs median')
     _draw_qq_normal(ax2, groups, title='qq-normal')
     fig.tight_layout()
-    fig.savefig(os.path.join(IMG_DIR, 'mean_median_and_qq.pdf'), format='pdf', dpi=300)
+    fig.savefig(os.path.join(IMG_DIR, 'mean_median_and_qq.png'), format='png', dpi=PLOT_DPI)
     plt.close(fig)
 
 
@@ -1041,7 +1056,7 @@ def plot_skew_kurtosis(data=None):
     rows = [{'skew': stats.skew(x), 'kurt': stats.kurtosis(x)} for x in groups.values()]
     df = pd.DataFrame(rows)
 
-    plt.figure(dpi=300)
+    plt.figure(dpi=PLOT_DPI)
     plt.scatter(df['skew'], df['kurt'], s=14, alpha=0.6, label='(FM,P,W) groups', zorder=3)
     plt.plot(0, 0, 'k*', ms=20, label='normal', zorder=4)
     for label, kurt in [('logistic', 1.2), ('laplace', 3.0), ('uniform', -1.2)]:
@@ -1052,7 +1067,7 @@ def plot_skew_kurtosis(data=None):
     plt.ylabel('excess kurtosis')
     plt.title('skewness vs excess kurtosis, per (FM, P, W)')
     plt.legend(fontsize=10)
-    plt.savefig(os.path.join(IMG_DIR, 'skew_vs_kurtosis.pdf'), format='pdf', dpi=300)
+    plt.savefig(os.path.join(IMG_DIR, 'skew_vs_kurtosis.png'), format='png', dpi=PLOT_DPI)
     plt.close()
 
 def _poly_r2(x, y, deg):
@@ -1118,7 +1133,7 @@ def _plot_by_p(data, ycol, ylabel, out_prefix, show_linear_fit):
     """Shared driver for the mean(M)/std(M) vs omega, grouped-by-P plots."""
     for fm in sorted(data.FM.unique()):
         df_g = real_mean_M(data, fm)
-        plt.figure(dpi=300)
+        plt.figure(dpi=PLOT_DPI)
         for p in sorted(df_g.P.unique()):
             t = df_g[df_g.P == p].sort_values('W')
             w, y = t['W'].to_numpy(dtype=float), t[ycol].to_numpy(dtype=float)
@@ -1132,7 +1147,7 @@ def _plot_by_p(data, ycol, ylabel, out_prefix, show_linear_fit):
         plt.ylabel(ylabel)
         plt.title(f'FM={fm}')
         plt.legend(fontsize=10, ncol=2)
-        plt.savefig(os.path.join(IMG_DIR, f'{out_prefix}_FM_{fm}.pdf'), format='pdf', dpi=300)
+        plt.savefig(os.path.join(IMG_DIR, f'{out_prefix}_FM_{fm}.png'), format='png', dpi=PLOT_DPI)
         plt.close()
 
 
@@ -1286,7 +1301,7 @@ def _parse_args():
     parser.add_argument('--j', type=int, default=2, help='Higher momentum of the directly-fit pair.')
     parser.add_argument('--tag', default='_manual',
                         help="Suffix for the preview plot filenames, so they don't overwrite "
-                             "the pipeline's own M_real_vs_synthetic*_FM_{fm}.pdf.")
+                             "the pipeline's own M_real_vs_synthetic*_FM_{fm}.png.")
     return parser.parse_args()
 
 
@@ -1303,13 +1318,9 @@ if __name__ == '__main__':
             data = create_combined_data()
             plot_p_w_m_curves(data)
 
-        # baseline (gamma=0, so new_M.csv's derived moments stay exactly
-        # cross-pair consistent) -- see generate_m_omega_from_I_omega's docstring
-        # for why 'weighted'/'monotonic' (meant to prioritise higher P) aren't
-        # the default: both produce a degenerate (M<=0 everywhere) P=1 curve for
-        # FM=12/15 here.
-        generate_m_omega_from_I_omega(fit_method='baseline')
-        diagnose_fit_methods()
+        # alpha/beta/gamma come from abg_config (see preview_alpha_beta) -- no
+        # search, and no diagnose_fit_methods() comparison plots/CSV anymore.
+        generate_m_omega_from_I_omega()
         find_distribution_of_real_data()
         check_M_distribution()
         #plot_mean_vs_median()

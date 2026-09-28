@@ -30,6 +30,8 @@ env/
 !**/Data/**/
 !**/Data/**/*.txt
 
+**/OtherWay/**
+
 # Trained models and other model artifacts are never uploaded.
 model/
 Model/

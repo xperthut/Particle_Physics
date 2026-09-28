@@ -39,8 +39,8 @@ class Plot(object):
         matplotlib.rc("lines", marker="o", markeredgewidth=0, markersize=3,
                       dash_joinstyle="round",
                       solid_joinstyle="round")
-        matplotlib.rc("savefig", dpi=128, transparent=True)
-        matplotlib.rc("figure", dpi=128)
+        matplotlib.rc("savefig", dpi=330, transparent=True)
+        matplotlib.rc("figure", dpi=330)
         matplotlib.rc("grid", alpha=0.3)
         matplotlib.rc("path", simplify=True, snap=True)
         matplotlib.rc("font", family="serif")
@@ -101,7 +101,7 @@ class Plot(object):
         self.Plot.grid()
         return self
 
-    def save(self, filename, dpi=None, transparency=True):
+    def save(self, filename, dpi=330, transparency=True):
         self.Fig.savefig(filename, bbox_inches='tight', dpi=dpi,
                          transparent=transparency)
         return self

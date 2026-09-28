@@ -140,4 +140,4 @@ Plotter.Plot.legend([(p4[-1], p44[0])], [ r' $\mathit{\Delta \mathcal{I}_g(\omeg
 
 
 
-Plotter.save("DeltaIg-GB.pdf");
+Plotter.save("DeltaIg-GB.png");
