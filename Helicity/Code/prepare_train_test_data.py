@@ -7,6 +7,11 @@ pd.options.display.max_columns = None
 pd.options.display.max_rows = None
 pd.options.mode.chained_assignment = None
 
+# Per the domain scientist, P=1 is never used: it is dropped here, so no model
+# is trained for it and train.py / train_error.py / reconstruct_real_data.py
+# (which all read the P values off these files) never see it.
+MIN_P = 2
+
 class Prepare_train_data:
     def __init__(self, name='', Data_dir=''):
         self.name = name
@@ -34,6 +39,7 @@ class Prepare_train_data:
     def train_data(self):
         df_data = pd.read_csv(os.path.join(self.Data_dir, 'generated_Synthetic_exp_data.csv'))
         df_data = df_data[['FM','P','Exp','W','M']]
+        df_data = df_data[df_data.P >= MIN_P]
 
         # Each FM is its own physical series, so it gets its own raw-data
         # split and its own pair of train CSVs (P alone, no FM column, is

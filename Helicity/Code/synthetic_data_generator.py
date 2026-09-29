@@ -3,7 +3,8 @@
 Two stages, both per lattice ensemble (``FM`` = 09 / 12 / 15):
 
 1. ``create_combined_data`` -- concatenate the raw per-momentum RpITD files
-   into ``Data/2026/All_p_w_m.csv`` (with a single omega=0 anchor per (FM, P)).
+   into ``Data/2026/All_p_w_m.csv`` (with a single omega=0 anchor per (FM, P)),
+   keeping only the ``N_OMEGA_PER_FM[fm]`` smallest omega values per (FM, P).
 
 2. ``generate_m_omega_from_I_omega`` -- for each FM:
      a. read the fitted I(omega) line and interpolate it onto the real omega
@@ -45,6 +46,8 @@ PLOT_DPI = 330           # all figures are saved as PNG at this resolution
 VERSION = 2026
 DATA_DIR = f'../Data/{VERSION}/'
 IMG_DIR = f'../Data/{VERSION}/Images/'
+# fitted I(omega) line that the synthetic M is built from (lives with the raw rpitd files)
+ITD_FILE = os.path.join(DATA_DIR, 'rpitd', 'ITD-pol-fit1-line.txt')
 
 abg_config = {
     '09':{
@@ -64,6 +67,12 @@ abg_config = {
         },
 }
 
+# Number of real omega values kept per (FM, P): the smallest ones, i.e. Wilson-line
+# displacements z = 1..N (omega = p*z*const). Per the domain scientist, the larger-z
+# points are not used. Applied in create_combined_data, so every consumer of
+# All_p_w_m.csv sees only the kept points.
+N_OMEGA_PER_FM = {'09': 5, '12': 4, '15': 3}
+
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(IMG_DIR, exist_ok=True)
 
@@ -80,9 +89,19 @@ def get_smooth_curve(val, window=SMOOTH_WINDOW, polyorder=SMOOTH_POLYORDER):
         return val
     return savgol_filter(val, window_length=w, polyorder=polyorder, mode='interp')
 
-# I(omega) = B*mj + A*mi for the directly-fit momentum pair (i, j), j>i>=1,
-# with A = -i^2/(j^2-i^2), B = j^2/(j^2-i^2). (i, j) = (1, 2) -- A=-1/3,
-# B=4/3 -- is this repo's default pair everywhere below.
+# I(omega) = B*mj + A*mi for the directly-fit momentum pair (i, j), j>i>=2,
+# with A = -i^2/(j^2-i^2), B = j^2/(j^2-i^2). FIT_PAIR is this repo's default
+# pair everywhere below. Per the domain scientist, P=1 is never used for the
+# M estimation, so i >= 2 (P=1's M is derived from the pair's closed form).
+FIT_PAIR = (2, 4)
+
+
+def _check_pair(i, j):
+    if not 2 <= i < j:
+        raise ValueError(f'momentum pair (i={i}, j={j}) must satisfy 2 <= i < j -- '
+                         'P=1 is not used for M estimation.')
+
+
 def _ab_for_pair(i, j):
     """(A, B) coefficients of I = A*mi + B*mj for momentum pair i<j."""
     denom = float(j ** 2 - i ** 2)
@@ -113,6 +132,9 @@ def create_combined_data():
                 sep=' ', skiprows=2, header=None,
             )
             df.columns = ['Exp', 'Z', 'W', 'M']
+            # keep only the N_OMEGA_PER_FM[fm] smallest omega values for this P
+            kept_w = np.sort(df['W'].unique())[:N_OMEGA_PER_FM[fm]]
+            df = df[df['W'].isin(kept_w)].copy()
             df['P'] = p
             df['FM'] = int(fm)
 
@@ -183,9 +205,9 @@ def plot_I_omega(df_I):
     plt.close()
 
 
-def fit_mi_mj(I_omega, alpha, beta, i=1, j=2, record_loss=False, omega=None):
+def fit_mi_mj(I_omega, alpha, beta, i=FIT_PAIR[0], j=FIT_PAIR[1], record_loss=False, omega=None):
     """Gradient-descent fit of ``mi``, ``mj`` -- the directly-fit momentum
-    pair, ``j>i>=1``, default ``(i, j) = (1, 2)`` -- to
+    pair, ``j>i>=2``, default ``FIT_PAIR`` -- to
     ``I = A*mi + B*mj`` for each omega, with
     ``A = -i^2/(j^2-i^2)``, ``B = j^2/(j^2-i^2)`` (see ``_ab_for_pair``).
 
@@ -210,6 +232,7 @@ def fit_mi_mj(I_omega, alpha, beta, i=1, j=2, record_loss=False, omega=None):
     removes the discontinuity at its source rather than patching the one
     boundary point.
     """
+    _check_pair(i, j)
     Ai, Bj = _ab_for_pair(i, j)
     y = np.asarray(I_omega, dtype=float)
     mi = alpha * y
@@ -230,16 +253,12 @@ def fit_mi_mj(I_omega, alpha, beta, i=1, j=2, record_loss=False, omega=None):
     return mi, mj
 
 
-def fit_m1_m2(I_omega, alpha, beta, record_loss=False, omega=None):
-    """Backward-compatible alias for ``fit_mi_mj`` with the default (i, j) = (1, 2)."""
-    return fit_mi_mj(I_omega, alpha, beta, 1, 2, record_loss, omega)
-
-
-def estimate_M(omega, I_omega, n_p, alpha, beta, gamma=0.0, i=1, j=2):
+def estimate_M(omega, I_omega, n_p, alpha, beta, gamma=0.0, i=FIT_PAIR[0], j=FIT_PAIR[1]):
     """Long-form generated M: columns ``W``, ``P`` (1..n_p), ``Est_M``, ``Wkey``.
 
-    ``i, j`` (default 1, 2) -- the directly-fit momentum pair: ``mi``, ``mj``
-    come from ``fit_mi_mj``; every other P's moment is the closed form
+    ``i, j`` (default ``FIT_PAIR``, i >= 2) -- the directly-fit momentum pair:
+    ``mi``, ``mj`` come from ``fit_mi_mj``; every other P's moment (including
+    P=1, which is never fit directly) is the closed form
     ``m_k = ((k^2-i^2)*I + i^2*mi) / k^2``, the algebraic inverse of
     ``I = (k^2*m_k - i^2*mi)/(k^2-i^2)`` for *every* k -- so with gamma=0 any
     two P's reconstruct the same I(omega), a physical requirement (I(omega)
@@ -248,9 +267,9 @@ def estimate_M(omega, I_omega, n_p, alpha, beta, gamma=0.0, i=1, j=2):
     ``gamma`` -- damping of the derived (P not in {i, j}) moments (option A).
     The closed form tends to ``I(omega)`` as k grows past ``j``, which
     over-predicts the real data at high P.  ``gamma`` multiplies each derived
-    moment by ``exp(-gamma * (k - j))`` so the tail can be pulled down
-    without touching the directly-fit ``mi``, ``mj``.  ``gamma=0`` is the
-    original ansatz.
+    moment above ``j`` by ``exp(-gamma * (k - j))`` so the tail can be pulled
+    down without touching the directly-fit ``mi``, ``mj`` (moments below ``j``,
+    e.g. P=1, are left undamped).  ``gamma=0`` is the original ansatz.
     """
     mi, mj = fit_mi_mj(I_omega, alpha, beta, i, j)
     y = np.asarray(I_omega, dtype=float)
@@ -266,7 +285,7 @@ def estimate_M(omega, I_omega, n_p, alpha, beta, gamma=0.0, i=1, j=2):
     for k in range(1, n_p + 1):
         if k in (i, j):
             continue
-        cols[k] = (((k ** 2 - i ** 2) * y + (i ** 2) * mi) / (k ** 2)) * np.exp(-gamma * (k - j))
+        cols[k] = (((k ** 2 - i ** 2) * y + (i ** 2) * mi) / (k ** 2)) * np.exp(-gamma * max(k - j, 0))
 
     df = pd.DataFrame(cols).melt(id_vars='W', var_name='P', value_name='Est_M')
     df['P'] = df['P'].astype(int)
@@ -299,10 +318,10 @@ def match_real_and_estimated_M(df_real_g, df_est, weights=None):
 
 
 def _fit(df_real_g, omega, I_omega, n_p, seeds, use_gamma, weights, monotonic_penalty=0.0,
-         i=1, j=2):
+         i=FIT_PAIR[0], j=FIT_PAIR[1]):
     """Multi-start Nelder-Mead core shared by the fit_* functions.
 
-    ``i, j`` (default 1, 2) -- the directly-fit momentum pair (see ``estimate_M``).
+    ``i, j`` (default ``FIT_PAIR``) -- the directly-fit momentum pair (see ``estimate_M``).
 
     The objective is evaluated with plain numpy (no per-iteration DataFrame
     build) since it runs thousands of times.
@@ -343,7 +362,7 @@ def _fit(df_real_g, omega, I_omega, n_p, seeds, use_gamma, weights, monotonic_pe
         mi = np.where(y_zero, 0.0, mi)[pos]
         mj = np.where(y_zero, 0.0, mj)[pos]
         yi = y[pos]
-        derived = ((P ** 2 - i * i) * yi + (i * i) * mi) / (P ** 2) * np.exp(-gamma * (P - j))
+        derived = ((P ** 2 - i * i) * yi + (i * i) * mi) / (P ** 2) * np.exp(-gamma * np.maximum(P - j, 0))
         est = np.where(P == float(i), mi, np.where(P == float(j), mj, derived))
         total = float(np.sum(w * np.abs(real_M - est)))
 
@@ -365,10 +384,10 @@ def _fit(df_real_g, omega, I_omega, n_p, seeds, use_gamma, weights, monotonic_pe
     return best
 
 
-def fit_alpha_beta(df_real_g, omega, I_omega, n_p, i=1, j=2):
+def fit_alpha_beta(df_real_g, omega, I_omega, n_p, i=FIT_PAIR[0], j=FIT_PAIR[1]):
     """Baseline: (alpha, beta) minimising the unweighted sum |Mean_M - Est_M|.
 
-    ``i, j`` (default 1, 2) -- the directly-fit momentum pair (see ``estimate_M``).
+    ``i, j`` (default ``FIT_PAIR``) -- the directly-fit momentum pair (see ``estimate_M``).
     """
     # beta now scales I (fit_mi_mj's mj seed is beta*I, not a flat constant),
     # so it plays the same role as alpha and needs the same seed range.
@@ -377,12 +396,12 @@ def fit_alpha_beta(df_real_g, omega, I_omega, n_p, i=1, j=2):
     return float(best.x[0]), float(best.x[1]), float(best.fun)
 
 
-def fit_alpha_beta_weighted(df_real_g, omega, I_omega, n_p, p_weight_exp=0.5, i=1, j=2):
+def fit_alpha_beta_weighted(df_real_g, omega, I_omega, n_p, p_weight_exp=0.5, i=FIT_PAIR[0], j=FIT_PAIR[1]):
     """Option D: (alpha, beta) under the per-P weight ``(1/RMS_P) * P**p_weight_exp``.
 
     Same 2-parameter ansatz as ``fit_alpha_beta`` -- only the objective weighting
     changes, so this shows how far re-weighting alone can shift the fit toward
-    high P. ``i, j`` (default 1, 2) -- the directly-fit momentum pair.
+    high P. ``i, j`` (default ``FIT_PAIR``) -- the directly-fit momentum pair.
     """
     weights = _p_weights(df_real_g, p_weight_exp)
     seeds = [(a, b) for a in (1.0, 10.0, 50.0, 310.0, 1000.0) for b in (1.0, 10.0, 50.0, 310.0, 1000.0)]
@@ -391,11 +410,11 @@ def fit_alpha_beta_weighted(df_real_g, omega, I_omega, n_p, p_weight_exp=0.5, i=
 
 
 def fit_alpha_beta_monotonic(df_real_g, omega, I_omega, n_p, p_weight_exp=0.5, monotonic_penalty=200.0,
-                              i=1, j=2):
+                              i=FIT_PAIR[0], j=FIT_PAIR[1]):
     """(alpha, beta) minimising the P-weighted L1 error subject to a strict
     best-fit-at-highest-P ordering (see ``_fit``'s ``monotonic_penalty``).
 
-    ``i, j`` (default 1, 2) -- the directly-fit momentum pair. P-weighting
+    ``i, j`` (default ``FIT_PAIR``) -- the directly-fit momentum pair. P-weighting
     alone (``fit_alpha_beta_weighted``) shifts the P=i-vs-P=j balance but
     does not reliably make the rest of the P's relative error decrease
     monotonically -- empirically it can go either way depending on alpha's
@@ -411,12 +430,12 @@ def fit_alpha_beta_monotonic(df_real_g, omega, I_omega, n_p, p_weight_exp=0.5, m
     return float(best.x[0]), float(best.x[1]), float(best.fun)
 
 
-def fit_alpha_beta_gamma(df_real_g, omega, I_omega, n_p, p_weight_exp=0.0, i=1, j=2):
+def fit_alpha_beta_gamma(df_real_g, omega, I_omega, n_p, p_weight_exp=0.0, i=FIT_PAIR[0], j=FIT_PAIR[1]):
     """Option A: (alpha, beta, gamma) with the high-P damping term in ``estimate_M``.
 
     Uses the per-P weight (default exp=0, i.e. 1/RMS_P) so gamma is driven by the
     high-P shape rather than swamped by the large P=i residuals. ``i, j``
-    (default 1, 2) -- the directly-fit momentum pair.
+    (default ``FIT_PAIR``) -- the directly-fit momentum pair.
     """
     weights = _p_weights(df_real_g, p_weight_exp)
     seeds = [(a, b, g) for a in (10.0, 50.0, 300.0) for b in (10.0, 50.0, 300.0) for g in (0.0, 0.3, 0.8)]
@@ -510,10 +529,10 @@ def plot_real_vs_synthetic(df_g, est_full, fm, alpha, beta, full_range=False, ga
     plt.close(fig)
 
 
-def generate_m_omega_from_I_omega(i=1, j=2):
+def generate_m_omega_from_I_omega(i=FIT_PAIR[0], j=FIT_PAIR[1]):
     """Write the generated M(omega) tables/plots per FM, using ``abg_config``.
 
-    ``i, j`` (default 1, 2, ``j>i>=1``) -- the directly-fit momentum pair for
+    ``i, j`` (default ``FIT_PAIR``, ``j>i>=2``) -- the directly-fit momentum pair for
     every FM (see ``estimate_M``); every other P's moment is derived from it.
 
     ``alpha``/``beta``/``gamma`` are no longer searched for -- every FM present
@@ -531,7 +550,7 @@ def generate_m_omega_from_I_omega(i=1, j=2):
     moments to better match the real per-P M magnitude (see ``estimate_M``),
     but breaks this cross-pair consistency for every pair except (i, j).
     """
-    df_I = pd.read_csv(os.path.join(DATA_DIR, 'ITD-pol-fit1-line.txt'), header=None, sep=' ')
+    df_I = pd.read_csv(ITD_FILE, header=None, sep=' ')
     df_I.columns = ['W', 'I']
     plot_I_omega(df_I)
 
@@ -607,11 +626,11 @@ def _per_p_rel_rms(df_real_g, est):
     return out
 
 
-def preview_alpha_beta(fm, alpha, beta, gamma=0.0, i=1, j=2, tag='_manual'):
+def preview_alpha_beta(fm, alpha, beta, gamma=0.0, i=FIT_PAIR[0], j=FIT_PAIR[1], tag='_manual'):
     """Hand-tune (alpha, beta[, gamma]) for one FM and see the effect immediately.
 
     Skips ``create_combined_data`` and the ``fit_alpha_beta*`` search entirely --
-    it just reloads ``All_p_w_m.csv``/``ITD-pol-fit1-line.txt`` (already on disk
+    it just reloads ``All_p_w_m.csv``/``rpitd/ITD-pol-fit1-line.txt`` (already on disk
     after one run of ``generate_m_omega_from_I_omega``), builds ``estimate_M`` at
     the values you pass in, prints the per-P fit quality, and rewrites
     ``M_real_vs_synthetic*_FM_{fm}{tag}*.png`` (``tag`` defaults to ``'_manual'``
@@ -621,9 +640,9 @@ def preview_alpha_beta(fm, alpha, beta, gamma=0.0, i=1, j=2, tag='_manual'):
     well enough; nothing here writes ``new_M.csv`` or ``optimal_alpha_beta.csv``,
     so it's safe to explore without disturbing the pipeline's saved fit.
 
-    Only ``mi``/``mj`` (P = i, j; default 1, 2) are direct functions of
-    alpha/beta -- every other P (including P=3, 4) is the closed-form derived
-    moment from ``estimate_M``, so alpha/beta move P=3..5 only indirectly
+    Only ``mi``/``mj`` (P = i, j; default ``FIT_PAIR`` = 2, 4) are direct functions of
+    alpha/beta -- every other P (including P=1, 3, 5) is the closed-form derived
+    moment from ``estimate_M``, so alpha/beta move the other P only indirectly
     through mi/I; ``gamma`` (default 0, i.e. off) is the other knob available,
     damping just the derived moments -- see ``estimate_M``'s docstring.
 
@@ -632,7 +651,7 @@ def preview_alpha_beta(fm, alpha, beta, gamma=0.0, i=1, j=2, tag='_manual'):
     and a per-P DataFrame of ``mean_abs_diff`` / ``rel_rms_pct`` / ``n`` so you
     can compare candidates numerically, not just by eyeballing the plots.
     """
-    df_I = pd.read_csv(os.path.join(DATA_DIR, 'ITD-pol-fit1-line.txt'), header=None, sep=' ')
+    df_I = pd.read_csv(ITD_FILE, header=None, sep=' ')
     df_I.columns = ['W', 'I']
 
     data = pd.read_csv(os.path.join(DATA_DIR, 'All_p_w_m.csv'))
@@ -684,7 +703,7 @@ def diagnose_fit_methods():
     manually (e.g. from a notebook/REPL) if you want to re-run the search anyway,
     for a new ensemble or to sanity-check an ``abg_config`` value.
     """
-    df_I = pd.read_csv(os.path.join(DATA_DIR, 'ITD-pol-fit1-line.txt'), header=None, sep=' ')
+    df_I = pd.read_csv(ITD_FILE, header=None, sep=' ')
     df_I.columns = ['W', 'I']
     data = pd.read_csv(os.path.join(DATA_DIR, 'All_p_w_m.csv'))
 
@@ -1297,8 +1316,9 @@ def _parse_args():
     parser.add_argument('--beta', type=float, default=None, help='beta to preview for --fm.')
     parser.add_argument('--gamma', type=float, default=0.0,
                         help='Optional high-P damping term (see estimate_M). Default 0 (off).')
-    parser.add_argument('--i', type=int, default=1, help='Lower momentum of the directly-fit pair.')
-    parser.add_argument('--j', type=int, default=2, help='Higher momentum of the directly-fit pair.')
+    parser.add_argument('--i', type=int, default=FIT_PAIR[0],
+                        help='Lower momentum of the directly-fit pair (>= 2; P=1 is never used).')
+    parser.add_argument('--j', type=int, default=FIT_PAIR[1], help='Higher momentum of the directly-fit pair.')
     parser.add_argument('--tag', default='_manual',
                         help="Suffix for the preview plot filenames, so they don't overwrite "
                              "the pipeline's own M_real_vs_synthetic*_FM_{fm}.png.")
@@ -1314,9 +1334,10 @@ if __name__ == '__main__':
         preview_alpha_beta(args.fm, args.alpha, args.beta, gamma=args.gamma,
                            i=args.i, j=args.j, tag=args.tag)
     else:
-        if not os.path.exists(os.path.join(DATA_DIR, 'All_p_w_m.csv')):
-            data = create_combined_data()
-            plot_p_w_m_curves(data)
+        # always rebuild (cheap) so a stale All_p_w_m.csv never outlives a
+        # change to N_OMEGA_PER_FM
+        data = create_combined_data()
+        plot_p_w_m_curves(data)
 
         # alpha/beta/gamma come from abg_config (see preview_alpha_beta) -- no
         # search, and no diagnose_fit_methods() comparison plots/CSV anymore.
