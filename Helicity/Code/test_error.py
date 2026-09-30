@@ -9,7 +9,8 @@ each with columns  FM, P, Exp, W, anchored, M_GB, M_RF, M_XGB.  This script
 processes every such file it finds and, per (variant, FM):
 
   * averages each model's M over the Exp replicas -> Mean_M_* / Std_M_* per (P, W);
-  * combines every momentum pair (2 <= p1 < p2; P=1 is never used) into an Ioffe-time estimate
+  * combines every momentum pair (2 <= p1 < p2; P=1 is left out of the pairs only --
+    it is still averaged, written and plotted as an M curve) into an Ioffe-time estimate
         I(w) = (p2^2 * M(p2, w) - p1^2 * M(p1, w)) / (p2^2 - p1^2)
     on the Exp-averaged mean curve, then averages the non-negative pair
     estimates at each w (0 where every pair is negative).  With gamma=0,
@@ -54,7 +55,7 @@ VARIANT_TITLE = {'no_exp': 'without Exp feature', 'with_exp': 'with Exp feature'
 W_DECIMALS = 1
 SMOOTH_WINDOW = 60       # Savitzky-Golay window in grid points (0.1 each)
 SMOOTH_POLYORDER = 3
-MIN_P = 2                # P=1 is never used (per the domain scientist), incl. in the I pairs
+MIN_P = 2                # smallest P allowed in an I(omega) pair; M curves keep every P (incl. P=1)
 
 _FILE_RE = re.compile(r'Real_data_projected_(.+)_(no_exp|with_exp)_v2\.csv$')
 
@@ -115,14 +116,14 @@ class Test_Error:
         return col, vals
 
     def _compute_I(self, df_ms):
-        """I(w) averaged over every (i<j) momentum pair, + smoothed I(w).
+        """I(w) averaged over every (MIN_P <= i < j) momentum pair, + smoothed I(w).
 
         At each W only the non-negative pair estimates enter the mean; if every
         pair is negative there, I(w) is set to 0 (I is physically non-negative).
         """
-        present = sorted(df_ms.P.unique())
+        present = sorted(p for p in df_ms.P.unique() if p >= MIN_P)
         if len(present) < 2:
-            print(f'  need at least two P values, have {present}; skipping I(omega)')
+            print(f'  need at least two P >= {MIN_P}, have {present}; skipping I(omega)')
             return None
 
         rows = {}
@@ -192,7 +193,7 @@ class Test_Error:
         anchor_note = (f'   (real data anchors $\\omega\\leq${w_anchor:.1f}, '
                        f'dashed line; beyond is extrapolation)' if w_anchor else '')
         fig.suptitle(f'FM={fm}  [{VARIANT_TITLE.get(variant, variant)}]   '
-                     f'I($\\omega$) averaged over all $p_z$ pairs{anchor_note}')
+                     f'I($\\omega$) averaged over all $p_z\\geq${MIN_P} pairs{anchor_note}')
         fig.tight_layout()
         os.makedirs(self.img_dir, exist_ok=True)
         out_png = os.path.join(self.img_dir, f'projected_I_{variant}_{fm}.png')
@@ -209,7 +210,6 @@ class Test_Error:
         for name, fm, variant in found:
             data = pd.read_csv(os.path.join(self.data_dir, name),
                                usecols=lambda c: c != 'FM')
-            data = data[data.P >= MIN_P].copy()
             data['W'] = np.round(data['W'], W_DECIMALS)
             print(f'[{variant}] FM={fm}: {len(data)} rows, P={sorted(data.P.unique())}, '
                   f'{data.Exp.nunique()} Exp replicas')

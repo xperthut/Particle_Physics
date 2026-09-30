@@ -7,7 +7,7 @@ Two stages, both per lattice ensemble (``FM`` = 09 / 12 / 15):
    keeping only the ``N_OMEGA_PER_FM[fm]`` smallest omega values per (FM, P).
 
 2. ``generate_m_omega_from_I_omega`` -- for each FM:
-     a. read the fitted I(omega) line and interpolate it onto the real omega
+     a. read that FM's fitted I(omega) line (`ITD_FILE`, one per FM) and interpolate it onto the real omega
         grid of that ensemble;
      b. fit mi = M(omega, P=i) and mj = M(omega, P=j) where j>i>0, by gradient descent on
             I = ((j^2 * mj) - (i^2 * mi)) / (j^2 - i^2)
@@ -46,24 +46,24 @@ PLOT_DPI = 330           # all figures are saved as PNG at this resolution
 VERSION = 2026
 DATA_DIR = f'../Data/{VERSION}/'
 IMG_DIR = f'../Data/{VERSION}/Images/'
-# fitted I(omega) line that the synthetic M is built from (lives with the raw rpitd files)
-ITD_FILE = os.path.join(DATA_DIR, 'rpitd', 'ITD-pol-fit1-line.txt')
+# fitted I(omega) lines the synthetic M is built from, one per FM (csv: W, FM, I(W))
+ITD_FILE = os.path.join(DATA_DIR, 'rpitd', 'ITD.csv')
 
 abg_config = {
     '09':{
-        'alpha': 55.0,
-        'beta': -6.0,
-        'gamma': 0.0,
+        'alpha': 15.0,
+        'beta': -15.0,
+        'gamma': 0.4,
     },
     '12':{
-            'alpha': 20.0,
-            'beta': 40.0,
-            'gamma': 0.0,
+            'alpha': 17.0,
+            'beta': -40.0,
+            'gamma': 1.6,
         },
     '15':{
-            'alpha': 2.0,
-            'beta': 50.0,
-            'gamma': 0.0,
+            'alpha': 12.6,
+            'beta': -35.0,
+            'gamma': 1.0,
         },
 }
 
@@ -93,7 +93,7 @@ def get_smooth_curve(val, window=SMOOTH_WINDOW, polyorder=SMOOTH_POLYORDER):
 # with A = -i^2/(j^2-i^2), B = j^2/(j^2-i^2). FIT_PAIR is this repo's default
 # pair everywhere below. Per the domain scientist, P=1 is never used for the
 # M estimation, so i >= 2 (P=1's M is derived from the pair's closed form).
-FIT_PAIR = (2, 4)
+FIT_PAIR = (2, 3)
 
 
 def _check_pair(i, j):
@@ -114,7 +114,7 @@ W_SCALE = 10
 
 # Gradient-descent hyper-parameters for the mi/mj fit.
 LR = 0.01
-EPOCHS = 100
+EPOCHS = 200
 
 
 def _w_key(w):
@@ -195,14 +195,39 @@ def plot_p_w_m_curves(data=None):
         plt.savefig(os.path.join(IMG_DIR, f'P_W_M_curves_FM_{fm}.png'), format='png', dpi=PLOT_DPI)
         plt.close()
 
+def get_FM(fm):
+    if fm==9: return '0.09'
+    elif fm==12: return '0.12'
+    elif fm==15: return '0.15'
+
+    return str(round(fm/100, 2))
 
 def plot_I_omega(df_I):
     plt.figure(dpi=PLOT_DPI)
-    plt.plot(df_I.W, df_I.I, '-o')
+    for fm in sorted(df_I.FM.unique()):
+        plt.plot(df_I[df_I.FM==fm].W, df_I[df_I.FM==fm].I, '-o', label=f'FM={get_FM(fm)}')
     plt.xlabel(r'$\omega$')
     plt.ylabel(r'$\Delta \mathcal{I}(\omega)$')
+    plt.legend()
     plt.savefig(os.path.join(IMG_DIR, 'I(w).png'), format='png', dpi=PLOT_DPI)
     plt.close()
+
+
+def load_itd():
+    """Read ``ITD_FILE`` (csv with header ``W,FM,I(W)``) as columns ``W, FM, I``."""
+    df_I = pd.read_csv(ITD_FILE)
+    df_I.columns = ['W', 'FM', 'I']
+    df_I['FM'] = df_I['FM'].astype(int)
+    return df_I.sort_values(['FM', 'W']).reset_index(drop=True)
+
+
+def itd_for_fm(df_I, fm):
+    """``(W, I)`` arrays of the I(omega) line for ensemble ``fm`` (e.g. 9 or '09')."""
+    g = df_I[df_I.FM == int(fm)]
+    if g.empty:
+        raise ValueError(f'{ITD_FILE} has no I(omega) rows for FM={fm} '
+                         f'(available: {sorted(df_I.FM.unique())}).')
+    return g['W'].to_numpy(), g['I'].to_numpy()
 
 
 def fit_mi_mj(I_omega, alpha, beta, i=FIT_PAIR[0], j=FIT_PAIR[1], record_loss=False, omega=None):
@@ -550,8 +575,7 @@ def generate_m_omega_from_I_omega(i=FIT_PAIR[0], j=FIT_PAIR[1]):
     moments to better match the real per-P M magnitude (see ``estimate_M``),
     but breaks this cross-pair consistency for every pair except (i, j).
     """
-    df_I = pd.read_csv(ITD_FILE, header=None, sep=' ')
-    df_I.columns = ['W', 'I']
+    df_I = load_itd()
     plot_I_omega(df_I)
 
     data = pd.read_csv(os.path.join(DATA_DIR, 'All_p_w_m.csv'))
@@ -569,7 +593,8 @@ def generate_m_omega_from_I_omega(i=FIT_PAIR[0], j=FIT_PAIR[1]):
 
         # real omega grid for this ensemble, with I(omega) interpolated onto it
         omega = np.sort(df_g['W'].unique())
-        I_omega = np.interp(omega, df_I['W'].values, df_I['I'].values)
+        W_itd, I_itd = itd_for_fm(df_I, fm)
+        I_omega = np.interp(omega, W_itd, I_itd)
 
         cfg = abg_config[f'{int(fm):02d}']
         alpha, beta, gamma = cfg['alpha'], cfg['beta'], cfg.get('gamma', 0.0)
@@ -592,7 +617,7 @@ def generate_m_omega_from_I_omega(i=FIT_PAIR[0], j=FIT_PAIR[1]):
 
         # new_M is evaluated on the full ITD omega grid (0..20), not just the
         # sparse real grid used for fitting.
-        est_full = estimate_M(df_I['W'].values, df_I['I'].values, n_p, alpha, beta, gamma, i=i, j=j)
+        est_full = estimate_M(W_itd, I_itd, n_p, alpha, beta, gamma, i=i, j=j)
         new_M = est_full[['P', 'W', 'Est_M']].copy()
         new_M['FM'] = fm
         all_new_M.append(new_M)
@@ -630,7 +655,7 @@ def preview_alpha_beta(fm, alpha, beta, gamma=0.0, i=FIT_PAIR[0], j=FIT_PAIR[1],
     """Hand-tune (alpha, beta[, gamma]) for one FM and see the effect immediately.
 
     Skips ``create_combined_data`` and the ``fit_alpha_beta*`` search entirely --
-    it just reloads ``All_p_w_m.csv``/``rpitd/ITD-pol-fit1-line.txt`` (already on disk
+    it just reloads ``All_p_w_m.csv``/``rpitd/ITD.csv`` (already on disk
     after one run of ``generate_m_omega_from_I_omega``), builds ``estimate_M`` at
     the values you pass in, prints the per-P fit quality, and rewrites
     ``M_real_vs_synthetic*_FM_{fm}{tag}*.png`` (``tag`` defaults to ``'_manual'``
@@ -651,15 +676,14 @@ def preview_alpha_beta(fm, alpha, beta, gamma=0.0, i=FIT_PAIR[0], j=FIT_PAIR[1],
     and a per-P DataFrame of ``mean_abs_diff`` / ``rel_rms_pct`` / ``n`` so you
     can compare candidates numerically, not just by eyeballing the plots.
     """
-    df_I = pd.read_csv(ITD_FILE, header=None, sep=' ')
-    df_I.columns = ['W', 'I']
+    W_itd, I_itd = itd_for_fm(load_itd(), fm)
 
     data = pd.read_csv(os.path.join(DATA_DIR, 'All_p_w_m.csv'))
     df_g = real_mean_M(data, fm)
     n_p = int(df_g.P.nunique())
 
     omega = np.sort(df_g['W'].unique())
-    I_omega = np.interp(omega, df_I['W'].values, df_I['I'].values)
+    I_omega = np.interp(omega, W_itd, I_itd)
 
     est = estimate_M(omega, I_omega, n_p, alpha, beta, gamma, i=i, j=j)
     df_cmp = pd.merge(df_g, est, on=['P', 'Wkey'], how='inner', suffixes=('', '_est'))
@@ -680,7 +704,7 @@ def preview_alpha_beta(fm, alpha, beta, gamma=0.0, i=FIT_PAIR[0], j=FIT_PAIR[1],
     print(f'FM={fm}  alpha={alpha:.5g}  beta={beta:.5g}  gamma={gamma:.5g}')
     print(per_p.to_string(float_format=lambda x: f'{x:.4g}'))
 
-    est_full = estimate_M(df_I['W'].values, df_I['I'].values, n_p, alpha, beta, gamma, i=i, j=j)
+    est_full = estimate_M(W_itd, I_itd, n_p, alpha, beta, gamma, i=i, j=j)
 
     plot_real_vs_synthetic(df_g, est_full, fm, alpha, beta, gamma=gamma, tag=tag)
     plot_real_vs_synthetic(df_g, est_full, fm, alpha, beta, full_range=True, gamma=gamma, tag=tag)
@@ -703,8 +727,7 @@ def diagnose_fit_methods():
     manually (e.g. from a notebook/REPL) if you want to re-run the search anyway,
     for a new ensemble or to sanity-check an ``abg_config`` value.
     """
-    df_I = pd.read_csv(ITD_FILE, header=None, sep=' ')
-    df_I.columns = ['W', 'I']
+    df_I = load_itd()
     data = pd.read_csv(os.path.join(DATA_DIR, 'All_p_w_m.csv'))
 
     rows = []
@@ -712,7 +735,8 @@ def diagnose_fit_methods():
         df_g = real_mean_M(data, fm)
         n_p = int(df_g.P.nunique())
         omega = np.sort(df_g['W'].unique())
-        I_omega = np.interp(omega, df_I['W'].values, df_I['I'].values)
+        W_itd, I_itd = itd_for_fm(df_I, fm)
+        I_omega = np.interp(omega, W_itd, I_itd)
 
         runs = {}
         a, b, _ = fit_alpha_beta(df_g, omega, I_omega, n_p)
@@ -734,7 +758,7 @@ def diagnose_fit_methods():
             rows.append({'FM': fm, 'method': name, 'alpha': a, 'beta': b, 'gamma': gm,
                          **{f'relRMS_P{p}': rel.get(p) for p in range(1, n_p + 1)}})
 
-            est_full = estimate_M(df_I['W'].values, df_I['I'].values, n_p, a, b, gm)
+            est_full = estimate_M(W_itd, I_itd, n_p, a, b, gm)
             tag = '_' + name.replace(' ', '').replace('=', '')
             plot_real_vs_synthetic_combined(df_g, est_full, fm, a, b, gamma=gm, tag=tag)
 

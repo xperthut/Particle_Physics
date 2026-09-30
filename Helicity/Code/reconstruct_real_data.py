@@ -50,7 +50,6 @@ FEATURES = {'No': ['P'] + _LAGS, 'Yes': ['P', 'Exp'] + _LAGS}
 MODEL_NAMES = ['GB', 'RF', 'XGB']
 N_LAGS = 4          # number of (w, m) lag points feeding each prediction
 W_DECIMALS = 1      # omega grid is compared after rounding to this many decimals
-MIN_P = 2           # P=1 is never used (per the domain scientist); no model exists for it
 
 # exp_id -> output-filename token
 EXP_TOKEN = {'No': 'no_exp', 'Yes': 'with_exp'}
@@ -95,7 +94,6 @@ class Reconstruct_real_data:
             df = pd.read_csv(os.path.join(self.data_dir, 'generated_Synthetic_exp_data.csv'),
                              usecols=['FM', 'P', 'Exp', 'W', 'M'])
             df = df[df.FM == fm][['P', 'Exp', 'W', 'M']].copy()
-        df = df[df.P >= MIN_P].copy()
         df['W'] = np.round(df['W'], W_DECIMALS)
         return df
 
