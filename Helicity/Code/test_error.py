@@ -5,7 +5,8 @@ Converted from test_error.ipynb and fitted to the current 2026 layout.
 reconstruct_real_data.py writes one file per (FM, model variant):
     Data/2026/Real_data_projected_{fm}_no_exp_v2.csv     (rolled with *_exp_No)
     Data/2026/Real_data_projected_{fm}_with_exp_v2.csv    (rolled with *_exp_Yes)
-each with columns  FM, P, Exp, W, anchored, M_GB, M_RF, M_XGB.  This script
+each with columns  FM, P, Exp, W, anchored, M_<model> for every model that was
+rolled (GB, RF, XGB, NN, GP -- whichever were trained).  This script
 processes every such file it finds and, per (variant, FM):
 
   * averages each model's M over the Exp replicas -> Mean_M_* / Std_M_* per (P, W);
@@ -47,10 +48,12 @@ warnings.filterwarnings("ignore")
 
 pd.options.mode.chained_assignment = None
 
-MODEL_NAMES = ['GB', 'RF', 'XGB']
+MODEL_NAMES = ['GB', 'RF', 'XGB', 'NN', 'GP']
 MODEL_TITLES = {'GB': 'Gradient boosted tree',
                 'RF': 'Random forest',
-                'XGB': 'Extreme gradient boosted tree'}
+                'XGB': 'Extreme gradient boosted tree',
+                'NN': 'Neural network (MLP)',
+                'GP': 'Gaussian process'}
 VARIANT_TITLE = {'no_exp': 'without Exp feature', 'with_exp': 'with Exp feature'}
 W_DECIMALS = 1
 SMOOTH_WINDOW = 60       # Savitzky-Golay window in grid points (0.1 each)
@@ -99,10 +102,10 @@ class Test_Error:
                 out.append((name, m.group(1), m.group(2)))
         return out
 
-    def _mean_std_curves(self, data):
+    def _mean_std_curves(self, data, names):
         """One frame indexed by (P, W) with Mean_M_* / Std_M_* per model."""
         df = None
-        for name in MODEL_NAMES:
+        for name in names:
             part = get_mean_std(data, ['P', 'W'], f'M_{name}')
             df = part if df is None else df.merge(part, on=['P', 'W'])
         return df
@@ -115,7 +118,7 @@ class Test_Error:
         vals = ((p2 ** 2 * piv[p2] - p1 ** 2 * piv[p1]) / denom).to_numpy()
         return col, vals
 
-    def _compute_I(self, df_ms):
+    def _compute_I(self, df_ms, names):
         """I(w) averaged over every (MIN_P <= i < j) momentum pair, + smoothed I(w).
 
         At each W only the non-negative pair estimates enter the mean; if every
@@ -128,7 +131,7 @@ class Test_Error:
 
         rows = {}
         piv = None
-        for name in MODEL_NAMES:
+        for name in names:
             piv = (df_ms.pivot_table(index='W', columns='P', values=f'Mean_M_{name}')
                    .sort_index())
             tmp = {}
@@ -142,7 +145,7 @@ class Test_Error:
         rows['W'] = np.round(piv.index.to_numpy(), W_DECIMALS)
 
         df_I = pd.DataFrame(rows).sort_values('W').reset_index(drop=True)
-        for name in MODEL_NAMES:
+        for name in names:
             sm = get_smooth_curve(df_I[f'I_{name}'], self.smooth_window)
             sm = np.where(df_I['W'].to_numpy() == 0.0, 0.0, sm)   # I(0) = 0 exactly
             # I(omega) is physically non-negative everywhere; the raw combination
@@ -153,17 +156,17 @@ class Test_Error:
             # -- the raw I_* columns keep the unclipped values for diagnostics.
             sm = np.clip(sm, 0.0, None)
             df_I[f'smooth_I{name}'] = sm
-        return df_I[['W'] + [f'I_{n}' for n in MODEL_NAMES]
-                    + [f'smooth_I{n}' for n in MODEL_NAMES]]
+        return df_I[['W'] + [f'I_{n}' for n in names]
+                    + [f'smooth_I{n}' for n in names]]
 
-    def _plot(self, fm, variant, df_ms, df_I, w_anchor):
+    def _plot(self, fm, variant, df_ms, df_I, w_anchor, names):
         ordered_ps = sorted(df_ms.P.unique())
         colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
         n_rows = 2 if df_I is not None else 1
-        fig, axes = plt.subplots(n_rows, 3, figsize=(24, 9 * n_rows), dpi=330,
-                                 squeeze=False)
+        fig, axes = plt.subplots(n_rows, len(names), figsize=(8 * len(names), 9 * n_rows),
+                                 dpi=330, squeeze=False)
 
-        for col, name in enumerate(MODEL_NAMES):
+        for col, name in enumerate(names):
             ax = axes[0, col]
             f_mu, f_sd = f'Mean_M_{name}', f'Std_M_{name}'
             for k, p in enumerate(ordered_ps):
@@ -211,11 +214,12 @@ class Test_Error:
             data = pd.read_csv(os.path.join(self.data_dir, name),
                                usecols=lambda c: c != 'FM')
             data['W'] = np.round(data['W'], W_DECIMALS)
+            names = [n for n in MODEL_NAMES if f'M_{n}' in data.columns]
             print(f'[{variant}] FM={fm}: {len(data)} rows, P={sorted(data.P.unique())}, '
-                  f'{data.Exp.nunique()} Exp replicas')
+                  f'{data.Exp.nunique()} Exp replicas, models={names}')
 
-            df_ms = self._mean_std_curves(data)
-            df_I = self._compute_I(df_ms)
+            df_ms = self._mean_std_curves(data, names)
+            df_I = self._compute_I(df_ms, names)
 
             w_anchor = 0.0
             if 'anchored' in data.columns:
@@ -231,7 +235,7 @@ class Test_Error:
                 df_I.to_csv(I_out, index=False)
                 print(f'  I(omega) -> {I_out}')
 
-            self._plot(fm, variant, df_ms, df_I, w_anchor)
+            self._plot(fm, variant, df_ms, df_I, w_anchor, names)
 
 
 if __name__ == "__main__":

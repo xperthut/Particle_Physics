@@ -1,6 +1,11 @@
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
+from sklearn.neural_network import MLPRegressor
+from sklearn.compose import TransformedTargetRegressor
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.base import clone
+from sklearn.base import clone, BaseEstimator, RegressorMixin
 from sklearn import pipeline
 import sklearn
 import xgboost
@@ -26,6 +31,71 @@ DEFAULT_CV_SPLITS = 5
 # trades a little search precision for a lot of speed, not final-model
 # accuracy.
 DEFAULT_SEARCH_SAMPLE_SIZE = 20000
+# Rows a Gaussian process is fit on per P. Exact GP fitting is O(n^3) in time
+# and O(n^2) in memory, so unlike the other models it cannot be refit on the
+# full (~200k-row) per-P frame; it is fit on a seeded random subsample instead.
+DEFAULT_GP_MAX_SAMPLES = 2000
+
+
+class ChunkedGaussianProcessRegressor(GaussianProcessRegressor):
+    """GaussianProcessRegressor whose predict() runs in row chunks.
+
+    Plain predict() builds the full (n_query x n_train) kernel matrix at once,
+    which for a ~200k-row per-P train frame (train_error.py) is several GB.
+    Chunking keeps memory bounded without changing the result.
+    """
+    PREDICT_CHUNK = 20000
+
+    def predict(self, X, return_std=False, return_cov=False):
+        if return_cov or len(X) <= self.PREDICT_CHUNK:
+            return super().predict(X, return_std=return_std, return_cov=return_cov)
+        X = np.asarray(X, dtype=float)
+        parts = [super(ChunkedGaussianProcessRegressor, self).predict(
+                     X[i:i + self.PREDICT_CHUNK], return_std=return_std)
+                 for i in range(0, len(X), self.PREDICT_CHUNK)]
+        if return_std:
+            return (np.concatenate([m for m, _ in parts]),
+                    np.concatenate([s for _, s in parts]))
+        return np.concatenate(parts)
+
+
+class ScaledMLPRegressor(BaseEstimator, RegressorMixin):
+    """MLP with standardised inputs *and* target, sized by (width, depth).
+
+    M spans orders of magnitude across P, so the target is standardised too
+    (MLPRegressor does not do that itself). Layers halve in width:
+    width=64, depth=3 -> (64, 32, 16). Exposing width/depth as plain integers
+    lets BayesSearchCV search the architecture.
+    """
+
+    def __init__(self, width=32, depth=2, alpha=1e-3, learning_rate_init=1e-3,
+                 batch_size=256, max_iter=300, random_state=0):
+        self.width = width
+        self.depth = depth
+        self.alpha = alpha
+        self.learning_rate_init = learning_rate_init
+        self.batch_size = batch_size
+        self.max_iter = max_iter
+        self.random_state = random_state
+
+    def _hidden(self):
+        return tuple(max(int(self.width) // 2 ** k, 4) for k in range(int(self.depth)))
+
+    def fit(self, X, y):
+        mlp = MLPRegressor(hidden_layer_sizes=self._hidden(), activation='relu',
+                           alpha=self.alpha, learning_rate_init=self.learning_rate_init,
+                           batch_size=self.batch_size, max_iter=self.max_iter,
+                           early_stopping=True, n_iter_no_change=15,
+                           random_state=self.random_state)
+        self.model_ = pipeline.Pipeline([
+            ('scale', StandardScaler()),
+            ('mlp', TransformedTargetRegressor(regressor=mlp, transformer=StandardScaler())),
+        ])
+        self.model_.fit(X, y)
+        return self
+
+    def predict(self, X):
+        return self.model_.predict(X)
 
 
 def _to_native(value):
@@ -193,5 +263,92 @@ class Model:
             if verbose > 0:
                 print(bestModel)
                 print('{} done.'.format(p))
+
+        return model, best_params
+
+    def NeuralNetworkModel(self, df_train, verbose=0, n_iter=DEFAULT_N_ITER, **search_kwargs):
+        model = []
+        best_params = {}
+
+        if verbose > 0:
+            print('////////////////////////////////////////////// Neural network (MLP) regressor ////////////////////////////////')
+
+        for p in sorted(df_train.P.unique()):
+            tmp = df_train.loc[df_train.P == p]
+            X = tmp.iloc[:, :-1]
+            Y = tmp.iloc[:, -1:].values.ravel()
+
+            estimator = pipeline.Pipeline([
+                ('nn', ScaledMLPRegressor(random_state=int(p)))
+            ])
+
+            search_spaces = {
+                "nn__width": Integer(16, 128),
+                "nn__depth": Integer(1, 3),
+                "nn__alpha": Real(1e-6, 1e-1, prior="log-uniform"),
+                "nn__learning_rate_init": Real(1e-4, 1e-2, prior="log-uniform"),
+            }
+
+            bestModel, params = self._bayes_search(estimator, search_spaces, X, Y, p, n_iter, verbose, **search_kwargs)
+
+            model.append(bestModel)
+            best_params[int(p)] = params
+
+            if verbose > 0:
+                print(bestModel)
+                print('{} done.'.format(p))
+
+        return model, best_params
+
+    def GaussianProcessModel(self, df_train, verbose=0, n_iter=DEFAULT_N_ITER,
+                             gp_max_samples=DEFAULT_GP_MAX_SAMPLES, **search_kwargs):
+        """Per-P GP with an ARD RBF + white-noise kernel.
+
+        No BayesSearchCV here: the kernel hyperparameters (amplitude, one
+        length scale per feature, noise level) are fit by maximising the
+        marginal likelihood, which is how GPs are normally tuned. n_iter and
+        the search kwargs are accepted only so train.py can call every model
+        the same way. Each P is fit on at most ``gp_max_samples`` rows (seeded
+        per P), not on the full frame -- see DEFAULT_GP_MAX_SAMPLES.
+        """
+        model = []
+        best_params = {}
+
+        if verbose > 0:
+            print('////////////////////////////////////////////// Gaussian process regressor ////////////////////////////////')
+
+        for p in sorted(df_train.P.unique()):
+            tmp = df_train.loc[df_train.P == p].reset_index(drop=True)
+            if len(tmp) > gp_max_samples:
+                rng = np.random.RandomState(int(p))
+                tmp = tmp.iloc[np.sort(rng.choice(len(tmp), size=gp_max_samples, replace=False))]
+            X = tmp.iloc[:, :-1]
+            Y = tmp.iloc[:, -1:].values.ravel()
+
+            kernel = (ConstantKernel(1.0, (1e-3, 1e3))
+                      * RBF(length_scale=np.ones(X.shape[1]), length_scale_bounds=(1e-2, 1e3))
+                      + WhiteKernel(noise_level=1e-2, noise_level_bounds=(1e-8, 1.0)))
+
+            bestModel = pipeline.Pipeline([
+                ('scale', StandardScaler()),
+                ('gp', ChunkedGaussianProcessRegressor(kernel=kernel, normalize_y=True,
+                                                       n_restarts_optimizer=2,
+                                                       random_state=int(p))),
+            ])
+
+            start = time.time()
+            bestModel.fit(X, Y)
+            fitted = bestModel.named_steps['gp']
+
+            best_params[int(p)] = {
+                'kernel': str(fitted.kernel_),
+                'log_marginal_likelihood': float(fitted.log_marginal_likelihood_value_),
+                'n_fit_rows': int(len(X)),
+            }
+            model.append(bestModel)
+
+            if verbose > 0:
+                print(best_params[int(p)])
+                print('[P={}] GP fit on {} rows in {:.0f}s'.format(p, len(X), time.time() - start))
 
         return model, best_params

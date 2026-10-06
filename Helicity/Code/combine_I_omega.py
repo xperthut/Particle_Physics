@@ -74,7 +74,7 @@ def plot(df, w_real, model, variant, out_png):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", default='../Data/2026')
-    parser.add_argument("--model", default='GB', choices=['GB', 'RF', 'XGB'])
+    parser.add_argument("--model", default='GB', choices=['GB', 'RF', 'XGB', 'NN', 'GP'])
     parser.add_argument("--variant", default='no_exp', choices=['no_exp', 'with_exp'])
     args = parser.parse_args()
 

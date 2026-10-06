@@ -10,6 +10,7 @@ import re
 
 # with_exp_id -> the train-CSV name fragment written by prepare_train_test_data.py
 FILE_SUFFIX = {'Yes': 'with_exp', 'No': 'without_exp'}
+MODEL_TYPES = ['GB', 'RF', 'XGB', 'NN', 'GP']
 
 
 class Train:
@@ -24,6 +25,10 @@ class Train:
             return self.model.RandomForestModel(df_train, 1, n_iter, **search_kwargs)
         elif self.name == 'XGB':
             return self.model.XGBoostModel(df_train, 1, n_iter, **search_kwargs)
+        elif self.name == 'NN':
+            return self.model.NeuralNetworkModel(df_train, 1, n_iter, **search_kwargs)
+        elif self.name == 'GP':
+            return self.model.GaussianProcessModel(df_train, 1, n_iter, **search_kwargs)
 
     def train_model(self, df_train, fm, with_exp_id, model_dir, n_iter, search_kwargs):
         save_name = f"{self.name}_exp_{with_exp_id}"
@@ -58,7 +63,8 @@ if __name__ == "__main__":
     parser.add_argument("--fm", type=str, required=False, default="all",
                          help="Ensemble id (e.g. '9', '12', '15'), or 'all' to train every FM found in --data_dir.")
     parser.add_argument("--model_type", type=str, required=True,
-                         help="GB for Gradient boosted, RF for Random forest, and XGB for Extreme gradient boosted.")
+                         help="GB for Gradient boosted, RF for Random forest, XGB for Extreme gradient boosted, "
+                              "NN for a neural network (MLP), and GP for a Gaussian process.")
     parser.add_argument("--with_exp_id", type=str, required=False, default="No",
                          help="'Yes' trains on Synthetic_train_data_with_exp_{fm}.csv, 'No' on the without_exp variant.")
     parser.add_argument("--data_dir", type=str, required=False, default="../Data/2026",
@@ -72,10 +78,13 @@ if __name__ == "__main__":
     parser.add_argument("--search_sample_size", type=int, required=False, default=20000,
                          help="Row cap used while searching hyperparameters per P; the winning config is "
                               "still refit on the full per-P data afterwards.")
+    parser.add_argument("--gp_max_samples", type=int, required=False, default=2000,
+                         help="GP only: rows per P the Gaussian process is fit on (exact GP cost grows "
+                              "as n^3, so it is never fit on the full per-P data).")
 
     args = parser.parse_args()
 
-    if args.model_type not in ['GB', 'XGB', 'RF']:
+    if args.model_type not in MODEL_TYPES:
         print("Invalid model type.")
     elif args.with_exp_id not in FILE_SUFFIX:
         print("Invalid with_exp_id, must be 'Yes' or 'No'.")
@@ -85,7 +94,10 @@ if __name__ == "__main__":
         if not fms:
             print(f"No Synthetic_train_data_{FILE_SUFFIX[args.with_exp_id]}_*.csv files found in {args.data_dir}")
 
-        search_kwargs = {'cv_splits': args.cv_splits, 'search_sample_size': args.search_sample_size}
+        if args.model_type == 'GP':
+            search_kwargs = {'gp_max_samples': args.gp_max_samples}
+        else:
+            search_kwargs = {'cv_splits': args.cv_splits, 'search_sample_size': args.search_sample_size}
 
         for fm in fms:
             train_data = os.path.join(args.data_dir, f'Synthetic_train_data_{FILE_SUFFIX[args.with_exp_id]}_{fm}.csv')

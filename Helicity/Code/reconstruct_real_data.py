@@ -6,7 +6,7 @@ For every lattice ensemble (FM) and every (P, Exp) replica:
     omega grid, taking the *real* measured M wherever the real omega grid has
     that point and the synthetic mean elsewhere;
   * roll the window forward one synthetic-grid step (0.1) at a time.  At each
-    step the per-P GB / RF / XGB model predicts M at the next omega and that
+    step the per-P GB / RF / XGB / NN / GP model predicts M at the next omega and that
     prediction is fed back in as the newest lag -- real data is **never**
     consulted or substituted here, only within the initial seed window.
 
@@ -16,6 +16,10 @@ beyond the 5th omega step is a genuine, purely autoregressive model
 extrapolation with no teacher forcing.  RF is the least reliable in that
 tail -- a random forest cannot extrapolate past its training targets and
 tends to flat-line under long autoregression.
+
+Every model in ``MODEL_NAMES`` whose ``.sav`` exists for an FM is rolled and
+gets an ``M_{name}`` column; missing models are skipped with a note, so the
+output only carries the models that have been trained.
 
 The per-P model variant is chosen with ``--exp_id`` (default ``No`` -> the
 ``*_exp_No`` models, no Exp feature; ``Yes`` -> ``*_exp_Yes``).  The output
@@ -47,7 +51,7 @@ pd.options.mode.chained_assignment = None
 # extra Exp column; *_exp_No models do not.
 _LAGS = ['w1', 'm1', 'w2', 'm2', 'w3', 'm3', 'w4', 'm4', 'w5']
 FEATURES = {'No': ['P'] + _LAGS, 'Yes': ['P', 'Exp'] + _LAGS}
-MODEL_NAMES = ['GB', 'RF', 'XGB']
+MODEL_NAMES = ['GB', 'RF', 'XGB', 'NN', 'GP']
 N_LAGS = 4          # number of (w, m) lag points feeding each prediction
 W_DECIMALS = 1      # omega grid is compared after rounding to this many decimals
 
@@ -73,10 +77,14 @@ class Reconstruct_real_data:
 
         model.py appends one estimator per P in ``sorted(P.unique())`` order,
         so element i corresponds to ``ordered_ps[i]`` -- NOT to ``P == i + 1``.
+        Models without a saved .sav for this FM are left out.
         """
         models = {}
         for name in MODEL_NAMES:
             path = os.path.join(self.model_dir, str(fm), f'{name}_exp_{self.exp_id}.sav')
+            if not os.path.exists(path):
+                print(f'FM={fm} {name}: {path} not found, skipped')
+                continue
             est_list = joblib.load(path)
             if len(est_list) != len(ordered_ps):
                 raise ValueError(
@@ -126,11 +134,15 @@ class Reconstruct_real_data:
 
             ordered_ps = sorted(df_syn.P.unique())
             models = self._load_models(fm, ordered_ps)
+            names = list(models)
+            if not names:
+                print(f'FM={fm}: no trained *_exp_{self.exp_id}.sav models, nothing saved')
+                continue
             all_ws = np.array(sorted(df_syn.W.unique()), dtype=float)
 
             P_parts, E_parts, W_parts = [], [], []
             anchored_parts = []
-            pred_parts = {name: [] for name in MODEL_NAMES}
+            pred_parts = {name: [] for name in names}
 
             for p in ordered_ps:
                 gen_piv = (df_syn[df_syn.P == p]
@@ -177,18 +189,18 @@ class Reconstruct_real_data:
                     W_parts.append(np.full(n_exp, w))
                     anchored_parts.append(np.isfinite(a) if a is not None
                                           else np.zeros(n_exp, dtype=bool))
-                    for name in MODEL_NAMES:
+                    for name in names:
                         pred_parts[name].append(seed_M[:, j].copy())
 
                 # per-model rolling lag window [w1, m1, ... w4, m4]
                 lag_ws = np.tile(seed_ws, (n_exp, 1))
-                state = {name: self._interleave(lag_ws, seed_M.copy()) for name in MODEL_NAMES}
+                state = {name: self._interleave(lag_ws, seed_M.copy()) for name in names}
 
                 for w in all_ws[all_ws > seed_ws[-1]]:
                     w5 = np.full(n_exp, w, dtype=float)
 
                     step_val = {}
-                    for name in MODEL_NAMES:
+                    for name in names:
                         cols = ([p_col, exp_col, state[name], w5] if self.use_exp
                                 else [p_col, state[name], w5])
                         X = pd.DataFrame(np.column_stack(cols), columns=self.features)
@@ -199,7 +211,7 @@ class Reconstruct_real_data:
                     E_parts.append(exps)
                     W_parts.append(w5.copy())
                     anchored_parts.append(np.zeros(n_exp, dtype=bool))
-                    for name in MODEL_NAMES:
+                    for name in names:
                         pred_parts[name].append(step_val[name])
                         # slide: drop (w1, m1), append (w5, value used)
                         state[name] = np.column_stack(
@@ -219,9 +231,7 @@ class Reconstruct_real_data:
                 'Exp': np.concatenate(E_parts).astype(int),
                 'W': np.round(np.concatenate(W_parts), W_DECIMALS),
                 'anchored': np.concatenate(anchored_parts).astype(int),
-                'M_GB': np.concatenate(pred_parts['GB']),
-                'M_RF': np.concatenate(pred_parts['RF']),
-                'M_XGB': np.concatenate(pred_parts['XGB']),
+                **{f'M_{name}': np.concatenate(pred_parts[name]) for name in names},
             }).sort_values(['P', 'Exp', 'W']).reset_index(drop=True)
 
             token = EXP_TOKEN[self.exp_id]
@@ -236,7 +246,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", default='../Data/2026',
                         help="Directory with All_p_w_m.csv and generated_Synthetic_exp_data*.csv")
     parser.add_argument("--model_dir", default='../model/2026',
-                        help="Directory with {model_dir}/{fm}/{GB,RF,XGB}_exp_{id}.sav")
+                        help="Directory with {model_dir}/{fm}/{GB,RF,XGB,NN,GP}_exp_{id}.sav")
     parser.add_argument("--exp_id", default='No', choices=['No', 'Yes'],
                         help="Which per-P model variant to roll with (default: No / without_exp)")
     args = parser.parse_args()

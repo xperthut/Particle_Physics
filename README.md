@@ -5,8 +5,8 @@ and **unpolarized gluon parton distribution functions (PDFs)** from lattice
 QCD matrix elements computed at short distance and large momentum.
 
 Real lattice data is sparse in the Ioffe-time variable `W`, so the pipeline
-fits a small set of gradient-boosted, random forest, and XGBoost regressors
-to synthetically generated pseudo-experiment replicas, then uses those models
+fits a small set of regressors (gradient-boosted trees, random forest,
+XGBoost, a neural network, and a Gaussian process) to synthetically generated pseudo-experiment replicas, then uses those models
 to autoregressively extrapolate/reconstruct the matrix elements at values of
 `W` beyond what was directly simulated. The reconstructed matrix elements are
 then converted into Ioffe-time distributions (ITDs) and compared against
@@ -39,8 +39,8 @@ python generator.py
 # 2. Build sliding-window train/test frames
 python prepare_train_test_data.py
 
-# 3. Train a model (model_type: GB | RF | XGB; with_exp_id: Yes | No)
-python train.py --train_data '../Data/Synthetic_train_data_without_exp.csv' --with_exp_id 'No' --model_type 'GB'
+# 3. Train a model (model_type: GB | RF | XGB | NN | GP; with_exp_id: Yes | No)
+python train.py --fm all --with_exp_id 'No' --model_type 'GB'
 
 # 4. Check training error (RMSE) of saved models
 python train_error.py

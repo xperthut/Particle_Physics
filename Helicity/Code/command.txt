@@ -1,10 +1,14 @@
 python train.py --fm all --with_exp_id 'No' --model_type 'GB'
 python train.py --fm all --with_exp_id 'No' --model_type 'XGB'
 python train.py --fm all --with_exp_id 'No' --model_type 'RF'
+python train.py --fm all --with_exp_id 'No' --model_type 'NN'
+python train.py --fm all --with_exp_id 'No' --model_type 'GP'
 
 python train.py --fm all --with_exp_id 'Yes' --model_type 'GB'
 python train.py --fm all --with_exp_id 'Yes' --model_type 'XGB'
 python train.py --fm all --with_exp_id 'Yes' --model_type 'RF'
+python train.py --fm all --with_exp_id 'Yes' --model_type 'NN'
+python train.py --fm all --with_exp_id 'Yes' --model_type 'GP'
 
 # Single ensemble, e.g. FM 9 only:
 python train.py --fm 9 --with_exp_id 'Yes' --model_type 'XGB'
@@ -23,6 +27,16 @@ python train.py --fm 9 --with_exp_id 'Yes' --model_type 'XGB'
 # slowest model type (sequential boosting, no internal parallelism) --
 # lower --n_iter/--search_sample_size for it first if it's too slow, e.g.:
 #   python train.py --fm 9 --with_exp_id 'Yes' --model_type 'GB' --n_iter 10 --search_sample_size 10000
+#
+# NN (MLP, inputs and target standardised) uses the same BayesSearchCV knobs,
+# searching width/depth/alpha/learning rate.
+# GP ignores --n_iter/--cv_splits/--search_sample_size: its kernel is tuned by
+# maximum likelihood and it is fit on --gp_max_samples rows per P (default
+# 2000), since exact GP cost grows as n^3. Raise it for accuracy, lower it for speed:
+#   python train.py --fm 9 --with_exp_id 'No' --model_type 'GP' --gp_max_samples 3000
+#
+# reconstruct_real_data.py / train_error.py / test_error.py use whichever of
+# GB, RF, XGB, NN, GP have a saved .sav and skip the rest.
 
 
 # Execution order

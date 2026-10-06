@@ -3,9 +3,11 @@
 Mirrors train.py's layout: for every FM found in --data_dir it loads
     Data/2026/Synthetic_train_data_{with,without}_exp_{fm}.csv
 and the matching
-    model/2026/{fm}/{GB,RF,XGB}_exp_{Yes,No}.sav
+    model/2026/{fm}/{GB,RF,XGB,NN,GP}_exp_{Yes,No}.sav
 (each a list of per-P fitted estimators, in sorted-P order), predicts the
 'target' column and prints the in-sample RMSE and R2 per (FM, model, with_exp).
+GP is fit on a subsample (train.py --gp_max_samples), so most of its rows here
+are unseen and its "training" error is closer to a held-out error.
 
 Combinations whose train CSV or .sav file is missing are skipped with a note.
 
@@ -29,7 +31,7 @@ pd.options.mode.chained_assignment = None
 
 # with_exp_id -> the train-CSV name fragment written by prepare_train_test_data.py
 FILE_SUFFIX = {'Yes': 'with_exp', 'No': 'without_exp'}
-MODEL_TYPES = ['GB', 'RF', 'XGB']
+MODEL_TYPES = ['GB', 'RF', 'XGB', 'NN', 'GP']
 
 
 def discover_fms(data_dir, with_exp_id):
