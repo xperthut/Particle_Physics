@@ -7,7 +7,7 @@ reconstruct_real_data.py writes one file per (FM, model variant):
     Data/2026/Real_data_projected_{fm}_with_exp_v2.csv    (rolled with *_exp_Yes)
 each with columns  FM, P, Exp, W, anchored, M_<model> for every model that was
 rolled (GB, RF, XGB, NN, GP -- whichever were trained).  This script
-processes every such file it finds and, per (variant, FM):
+processes only the no_exp files (VARIANT) and, per FM:
 
   * averages each model's M over the Exp replicas -> Mean_M_* / Std_M_* per (P, W);
   * combines every momentum pair (2 <= p1 < p2; P=1 is left out of the pairs only --
@@ -29,6 +29,21 @@ processes every such file it finds and, per (variant, FM):
         Data/2026/Projected_I_{variant}_{fm}.csv
         Data/2026/Images/projected_I_{variant}_{fm}.png
 
+  * test error: scores each model's projection against the real lattice M in
+    Data/2026/All_p_w_m.csv at every real (P, Exp, W) point past the
+    N_SEED-point seed window -- points the autoregressive roll never saw.  The
+    projected curve (0.1 omega grid) is linearly interpolated onto the real,
+    unrounded omega and compared replica-by-replica (same Exp), giving RMSE / R2
+    per (FM, model), plus RMSE_mean on the Exp-averaged curves.  Models are
+    ranked overall by the average of their rank in mean RMSE and in mean R2
+    across FMs, written to
+        Data/2026/test_error_summary_no_exp.csv    (per FM, per model)
+        Data/2026/test_error_ranking_no_exp.csv    (overall ranking)
+    and only the top three are plotted (M with the real data overlaid, and I).
+    The single best model's smoothed I(w) for every FM is also drawn on one axis:
+        Data/2026/Images/best_model_I_no_exp_{model}.png
+        Data/2026/best_model_I_no_exp_{model}.csv     (FM, W, smoothed I)
+
 Run from Helicity/Code:  python test_error.py
 """
 
@@ -42,6 +57,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.signal import savgol_filter
+from sklearn.metrics import mean_squared_error, r2_score
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -56,9 +72,14 @@ MODEL_TITLES = {'GB': 'Gradient boosted tree',
                 'GP': 'Gaussian process'}
 VARIANT_TITLE = {'no_exp': 'without Exp feature', 'with_exp': 'with Exp feature'}
 W_DECIMALS = 1
-SMOOTH_WINDOW = 60       # Savitzky-Golay window in grid points (0.1 each)
+SMOOTH_WINDOW = 5       # Savitzky-Golay window in grid points (0.1 each)
 SMOOTH_POLYORDER = 3
 MIN_P = 2                # smallest P allowed in an I(omega) pair; M curves keep every P (incl. P=1)
+N_SEED = 4               # seed-window points per P in reconstruct_real_data.py (N_LAGS)
+TOP_K = 3
+# Only the *_exp_No models are evaluated: Exp is an arbitrary replica label, so
+# feeding it as a feature only invites per-replica memorisation.
+VARIANT = 'no_exp'
 
 _FILE_RE = re.compile(r'Real_data_projected_(.+)_(no_exp|with_exp)_v2\.csv$')
 
@@ -98,7 +119,7 @@ class Test_Error:
         out = []
         for name in sorted(os.listdir(self.data_dir)):
             m = _FILE_RE.match(name)
-            if m:
+            if m and m.group(2) == VARIANT:
                 out.append((name, m.group(1), m.group(2)))
         return out
 
@@ -159,9 +180,17 @@ class Test_Error:
         return df_I[['W'] + [f'I_{n}' for n in names]
                     + [f'smooth_I{n}' for n in names]]
 
-    def _plot(self, fm, variant, df_ms, df_I, w_anchor, names):
+    def _plot(self, fm, variant, df_ms, df_I, w_anchor, names, df_real=None, overall=None):
+        """M(w) (top row) and I(w) (bottom row), one column per model in ``names``.
+
+        Real lattice M (Exp mean +- std) is overlaid on the M panels as open
+        markers, and each column title carries the model's overall test rank.
+        """
         ordered_ps = sorted(df_ms.P.unique())
         colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+        real_ms = None
+        if df_real is not None and not df_real.empty:
+            real_ms = get_mean_std(df_real, ['P', 'W'], 'M')
         n_rows = 2 if df_I is not None else 1
         fig, axes = plt.subplots(n_rows, len(names), figsize=(8 * len(names), 9 * n_rows),
                                  dpi=330, squeeze=False)
@@ -174,7 +203,16 @@ class Test_Error:
                 c = colors[k % len(colors)]
                 ax.errorbar(t.W, t[f_mu], yerr=t[f_sd], ecolor=c, color=c,
                             label=f'$p_z$={p}' if col == 0 else None)
-            ax.set_title(MODEL_TITLES[name])
+                if real_ms is not None:
+                    r = real_ms[real_ms.P == p]
+                    ax.errorbar(r.W, r.Mean_M, yerr=r.Std_M, fmt='o', mfc='none', ms=7,
+                                color=c, label='real data' if col == 0 and k == 0 else None)
+            title = MODEL_TITLES[name]
+            if overall is not None and name in overall.index:
+                o = overall.loc[name]
+                title = (f'#{int(o.overall_rank)}  {title}\n'
+                         f'test RMSE={o.mean_RMSE:.4f}, $R^2$={o.mean_R2:.3f} (mean over FMs)')
+            ax.set_title(title)
             ax.set_xlabel(r'$\omega$')
             if col == 0:
                 ax.set_ylabel(r'$\Delta\mathfrak{M}(\omega)$')
@@ -195,21 +233,155 @@ class Test_Error:
 
         anchor_note = (f'   (real data anchors $\\omega\\leq${w_anchor:.1f}, '
                        f'dashed line; beyond is extrapolation)' if w_anchor else '')
-        fig.suptitle(f'FM={fm}  [{VARIANT_TITLE.get(variant, variant)}]   '
+        top_note = f'top {len(names)} models by test error   ' if overall is not None else ''
+        fig.suptitle(f'FM={fm}  [{VARIANT_TITLE.get(variant, variant)}]   {top_note}'
                      f'I($\\omega$) averaged over all $p_z\\geq${MIN_P} pairs{anchor_note}')
-        fig.tight_layout()
+        fig.tight_layout(rect=(0, 0, 1, 0.97))   # leave room for the suptitle
         os.makedirs(self.img_dir, exist_ok=True)
         out_png = os.path.join(self.img_dir, f'projected_I_{variant}_{fm}.png')
         fig.savefig(out_png, dpi=330)
         plt.close(fig)
         print(f'  plot -> {out_png}')
 
+    def _plot_best(self, best, per_fm, overall):
+        """Smoothed I(w) of the single best model, every FM on one axis."""
+        colors = ['#2a78d6', '#eb6834', '#1baf7a']     # validated categorical slots 1-3
+        styles = ['-', '--', '-.']                      # secondary encoding (not colour alone)
+        fig, ax = plt.subplots(figsize=(9, 6), dpi=330)
+        w_anchor = 0.0
+        curves = []                                     # plotted data, long format FM, W, I
+        fms = sorted(per_fm, key=lambda t: float(t[0]))
+        for k, (fm, _variant, _ms, df_I, w_anc, _names, _real) in enumerate(fms):
+            if df_I is None or f'smooth_I{best}' not in df_I:
+                continue
+            w, y = df_I['W'].to_numpy(), df_I[f'smooth_I{best}'].to_numpy()
+            c = colors[k % len(colors)]
+            ax.plot(w, y, styles[k % len(styles)], lw=2, color=c, label=f'FM={fm}')
+            i = int(np.argmax(y))                       # direct label at the peak
+            ax.annotate(f'FM={fm}', (w[i], y[i]), xytext=(0, 6), textcoords='offset points',
+                        ha='center', va='bottom', fontsize=9, color='0.2')
+            w_anchor = max(w_anchor, w_anc)
+            curves.append(pd.DataFrame({'FM': fm, 'W': w, 'I': y}))
+        if curves:
+            out_csv = os.path.join(self.data_dir, f'best_model_I_{VARIANT}_{best}.csv')
+            pd.concat(curves, ignore_index=True).to_csv(out_csv, index=False)
+            print(f'  best-model data -> {out_csv}')
+        if w_anchor > 0:
+            ax.axvline(w_anchor, ls=':', lw=1, color='0.5')
+        ax.grid(alpha=0.25, lw=0.5)
+        for side in ('top', 'right'):
+            ax.spines[side].set_visible(False)
+        ax.set_xlabel(r'$\omega$')
+        ax.set_ylabel(r'$\Delta\mathcal{I}_g(\omega)$')
+        o = overall.loc[best]
+        ax.set_title(f'{MODEL_TITLES[best]} (best mean test error: RMSE={o.mean_RMSE:.4f}, '
+                     f'$R^2$={o.mean_R2:.3f})\n'
+                     f'smoothed I($\\omega$), {VARIANT_TITLE[VARIANT]}', fontsize=10)
+        ax.legend(frameon=False)
+        fig.tight_layout()
+        out_png = os.path.join(self.img_dir, f'best_model_I_{VARIANT}_{best}.png')
+        fig.savefig(out_png, dpi=330)
+        plt.close(fig)
+        print(f'  best-model plot -> {out_png}')
+
+    def _load_real(self):
+        path = os.path.join(self.data_dir, 'All_p_w_m.csv')
+        if not os.path.exists(path):
+            print(f'{path} not found; test error skipped')
+            return None
+        return pd.read_csv(path, usecols=['FM', 'P', 'Exp', 'W', 'M'])
+
+    @staticmethod
+    def _test_error(data, df_real, names):
+        """{model: (rmse, r2, rmse_mean, n)} of the projection vs the real M.
+
+        Test points are the real (P, Exp, W) past the seed window (the first
+        N_SEED grid omegas per P, which are copied from real data / synthetic
+        mean). Each model's per-Exp curve is linearly interpolated onto the
+        real omega and compared to the same Exp's real M.
+        """
+        y_true, y_pred, keys = [], {n: [] for n in names}, []
+        for p in sorted(data.P.unique()):
+            proj = data[data.P == p]
+            real = df_real[df_real.P == p]
+            grid = np.sort(proj.W.unique())
+            if real.empty or len(grid) <= N_SEED:
+                continue
+            real = real[(real.W > grid[N_SEED - 1] + 1e-9) & (real.W <= grid[-1])
+                        & real.Exp.isin(proj.Exp.unique())]
+            if real.empty:
+                continue
+
+            w = real.W.to_numpy()
+            idx = np.clip(np.searchsorted(grid, w, side='right') - 1, 0, len(grid) - 2)
+            frac = (w - grid[idx]) / (grid[idx + 1] - grid[idx])
+            rows = np.arange(len(real))
+            for n in names:
+                piv = (proj.pivot_table(index='Exp', columns='W', values=f'M_{n}')
+                       .reindex(columns=grid))
+                arr = piv.reindex(real.Exp.to_numpy()).to_numpy()   # one row per real point
+                y_pred[n].append(arr[rows, idx] * (1 - frac) + arr[rows, idx + 1] * frac)
+            y_true.append(real.M.to_numpy())
+            keys.append(real[['P', 'W']])
+
+        if not y_true:
+            return {}
+        y_true = np.concatenate(y_true)
+        keys = pd.concat(keys, ignore_index=True)
+        out = {}
+        for n in names:
+            pred = np.concatenate(y_pred[n])
+            ok = np.isfinite(pred)
+            # Exp-averaged curves: mean real M vs mean prediction per (P, W)
+            mean = (keys.assign(t=y_true, y=pred)[ok].groupby(['P', 'W'])[['t', 'y']].mean())
+            out[n] = (float(np.sqrt(mean_squared_error(y_true[ok], pred[ok]))),
+                      float(r2_score(y_true[ok], pred[ok])),
+                      float(np.sqrt(mean_squared_error(mean.t, mean.y))),
+                      int(ok.sum()))
+        return out
+
+    def _rank(self, rows):
+        """Write the per-FM summary and the overall ranking; return the TOP_K model names.
+
+        Within one FM, RMSE and R2 share the same y_true, so they order the
+        models identically.  Across FMs they can disagree, so the overall score
+        is the average of the model's rank by mean RMSE (low = good) and by
+        mean R2 (high = good), ties broken by mean RMSE.
+        """
+        df = pd.DataFrame(rows)
+        df['rank'] = df.groupby('FM')['RMSE'].rank(method='min').astype(int)
+        df = df.sort_values(['FM', 'rank']).reset_index(drop=True)
+        out = os.path.join(self.data_dir, f'test_error_summary_{VARIANT}.csv')
+        df.to_csv(out, index=False)
+        print(f'\ntest error summary -> {out}')
+        print(df.to_string(index=False))
+
+        overall = (df.groupby('model')
+                   .agg(mean_RMSE=('RMSE', 'mean'), mean_R2=('R2', 'mean'),
+                        mean_RMSE_mean=('RMSE_mean', 'mean'), n_FM=('FM', 'nunique'))
+                   .reset_index())
+        overall['rank_RMSE'] = overall.mean_RMSE.rank(method='min')
+        overall['rank_R2'] = overall.mean_R2.rank(method='min', ascending=False)
+        overall['score'] = (overall.rank_RMSE + overall.rank_R2) / 2
+        overall = overall.sort_values(['score', 'mean_RMSE']).reset_index(drop=True)
+        overall['overall_rank'] = np.arange(1, len(overall) + 1)
+        out = os.path.join(self.data_dir, f'test_error_ranking_{VARIANT}.csv')
+        overall.to_csv(out, index=False)
+        print(f'\noverall ranking (mean RMSE + mean R2 across FMs) -> {out}')
+        print(overall.to_string(index=False))
+
+        top = overall.model.head(TOP_K).tolist()
+        print(f'\ntop {TOP_K} models: {top}')
+        return top, overall.set_index('model')
+
     def run(self):
         found = self._discover()
         if not found:
-            print(f'no Real_data_projected_*_{{no_exp,with_exp}}_v2.csv in {self.data_dir}')
+            print(f'no Real_data_projected_*_{VARIANT}_v2.csv in {self.data_dir}')
             return
 
+        df_real = self._load_real()
+        err_rows, per_fm = [], []
         for name, fm, variant in found:
             data = pd.read_csv(os.path.join(self.data_dir, name),
                                usecols=lambda c: c != 'FM')
@@ -235,7 +407,24 @@ class Test_Error:
                 df_I.to_csv(I_out, index=False)
                 print(f'  I(omega) -> {I_out}')
 
-            self._plot(fm, variant, df_ms, df_I, w_anchor, names)
+            real_fm = None
+            if df_real is not None:
+                real_fm = df_real[df_real.FM.astype(str) == str(fm)]
+                for model, (rmse, r2, rmse_mean, n) in self._test_error(data, real_fm, names).items():
+                    err_rows.append({'variant': variant, 'FM': fm, 'model': model,
+                                     'n_points': n, 'RMSE': rmse, 'R2': r2,
+                                     'RMSE_mean': rmse_mean})
+                    print(f'  test FM={fm:>3} {model:>3}  n={n:>6}  RMSE={rmse:.5f}  '
+                          f'R2={r2:.5f}  RMSE(Exp-mean)={rmse_mean:.5f}')
+            per_fm.append((fm, variant, df_ms, df_I, w_anchor, names, real_fm))
+
+        # plot only the top-TOP_K models (by test error); all models if untestable
+        top, overall = self._rank(err_rows) if err_rows else (None, None)
+        for fm, variant, df_ms, df_I, w_anchor, names, real_fm in per_fm:
+            plot_names = [n for n in top if n in names] if top else names
+            self._plot(fm, variant, df_ms, df_I, w_anchor, plot_names, real_fm, overall)
+        if top:
+            self._plot_best(top[0], per_fm, overall)
 
 
 if __name__ == "__main__":

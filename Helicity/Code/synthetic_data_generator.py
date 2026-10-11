@@ -63,17 +63,17 @@ ITD_FILE = os.path.join(DATA_DIR, 'rpitd', 'ITD.csv')
 
 abg_config = {
     '09':{
-        'alpha': 30.0,
+        'alpha': 7.5,
         'beta': 0.0,
         'gamma': 0.0,
     },
     '12':{
-            'alpha': 17.0,
+            'alpha': 6.5,
             'beta': 0.0,
             'gamma': 0.0,
         },
     '15':{
-            'alpha': 12.6,
+            'alpha': 5.5,
             'beta': 0.0,
             'gamma': 0.0,
         },
@@ -105,7 +105,7 @@ def get_smooth_curve(val, window=SMOOTH_WINDOW, polyorder=SMOOTH_POLYORDER):
 # with A = -i^2/(j^2-i^2), B = j^2/(j^2-i^2). FIT_PAIR is this repo's default
 # pair everywhere below. Per the domain scientist, P=1 is never used for the
 # M estimation, so i >= 2 (P=1's M is derived from the pair's closed form).
-FIT_PAIR = (1, 2)
+FIT_PAIR = (2, 3)
 
 def _check_pair(i, j):
     if not 1 <= i < j:
@@ -226,15 +226,16 @@ def plot_I_omega(df_I):
 
 def load_itd():
     """Read ``ITD_FILE`` (csv with header ``W,FM,I(W)``) as columns ``W, FM, I``."""
+    #df_I = pd.read_csv(ITD_FILE, header=None, sep=' ')
     df_I = pd.read_csv(ITD_FILE)
-    df_I.columns = ['W', 'FM', 'I']
+    df_I.columns = ['FM', 'W', 'I']
     df_I['FM'] = df_I['FM'].astype(int)
-    return df_I.sort_values(['FM', 'W']).reset_index(drop=True)
+    return df_I.sort_values(['W']).reset_index(drop=True)
 
 
 def itd_for_fm(df_I, fm):
     """``(W, I)`` arrays of the I(omega) line for ensemble ``fm`` (e.g. 9 or '09')."""
-    g = df_I[df_I.FM == int(fm)]
+    g = df_I[df_I.FM == int(fm)].copy() #
     if g.empty:
         raise ValueError(f'{ITD_FILE} has no I(omega) rows for FM={fm} '
                          f'(available: {sorted(df_I.FM.unique())}).')
@@ -611,7 +612,7 @@ def generate_m_omega_from_I_omega(i=FIT_PAIR[0], j=FIT_PAIR[1]):
         alpha, beta, gamma = cfg['alpha'], cfg['beta'], cfg.get('gamma', 0.0)
 
         # per-epoch loss trace for the mi/mj gradient descent
-        mi, mj, df_loss = fit_mi_mj(I_itd, alpha, beta, i, j, record_loss=True, omega=omega)
+        _, _, df_loss = fit_mi_mj(I_itd, alpha, beta, i, j, record_loss=True, omega=omega)
         df_loss.to_csv(os.path.join(DATA_DIR, f'loss_val_FM_{fm}.csv'), index=False)
 
         # real-vs-estimated comparison uses only the matched (sparse) omega grid
@@ -1337,9 +1338,8 @@ def generate_m_omega_from_distribution():
     print('N_fm (max real Exp count per FM):', N_fm)
     generate_synthetic_exp_data(new_M_S, N_fm)
 
-def generate_m_omega_and_I_omega():
+def generate_I_omega():
     """Per FM, fit the real per-(P, W) mean M to
-
         M(omega, P) = A * omega * exp(-slope * omega) * P**(-gamma) * exp(c * z2),
         z2 = min((omega / P)**2, z2_max)
 
@@ -1350,9 +1350,10 @@ def generate_m_omega_and_I_omega():
     I = A * omega * exp(-slope * omega), i.e. M at P=1 without the z2 term).
     """
 
-    def cells(df):
+    def cells(df, pl):
         g = df.groupby(["P", "W"], as_index=False).M.agg(mean="mean", std="std", n="count")
-        g = g[g.W > 0].copy()
+        g = g[(g.W > 0) & (g.P.isin(pl))].copy()
+        #g = g[g.P.isin([2])].copy()
         g["std"] = g["std"].fillna(0.0).clip(lower=1e-8)
         g["weight"] = g["n"] / g["std"] ** 2
         return g
@@ -1363,20 +1364,21 @@ def generate_m_omega_and_I_omega():
         return A * w * np.exp(-slope * w) * P ** (-gamma) * np.exp(c * z2)
 
 
-    def fit_fm(fm, raw):
+    def fit_fm(fm, raw, pl=[1,2,3,4]):
         sub = raw[raw.FM == fm]
-        tab = cells(sub)
+        tab = cells(sub, pl)
         z2_max = float(np.max((tab.W / tab.P) ** 2))
 
         def residual(th):
             A, slope, gamma, c = th
             model = predict(tab.W.to_numpy(), tab.P.to_numpy(), A, slope, gamma, c, z2_max)
+            #I = A * omega * np.exp(-slope * omega)
             return np.sqrt(tab.weight) * (model - tab["mean"])
 
         fit = least_squares(
             residual,
-            np.array([1.0, 0.25, 2.0, 0.0]),
-            bounds=([1e-4, 1e-4, 0.0, -2.0], [50.0, 3.0, 6.0, 2.0]),
+            np.array([0.5, 0.25, 1.5, 0.1]),
+            bounds=([0, 0, 0, 0], [3.0, 0.5, 3.0, 0.2]),
         )
         A, slope, gamma, c = fit.x
         model = predict(tab.W.to_numpy(), tab.P.to_numpy(), A, slope, gamma, c, z2_max)
@@ -1390,113 +1392,27 @@ def generate_m_omega_and_I_omega():
 
     def get_fermion(fm):
         return f'{(fm/100):0.2f}'
-
-    def plot_RS_combined(df_g, df_M, fm, full_range=False):
-        all_p = sorted(df_g.P.unique())
-        colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-        est_full = df_M[df_M.FM == fm].sort_values(['P', 'W'])
-
-        plt.figure(dpi=PLOT_DPI)
-        w_max = df_g['W'].max()
-        for i, p in enumerate(all_p):
-            c = colors[i % len(colors)]
-            r = df_g[df_g.P == p].sort_values('W')
-            s = est_full[est_full.P == p].sort_values('W')
-            if not full_range:
-                s = s[s.W <= w_max * 1.15]
-
-            plt.plot(s.W, s.Est_M, '-', color=c, lw=2, label=fr"synthetic $p_z$={p}")
-            plt.errorbar(r.W, r.Mean_M, yerr=r.Std_M, fmt='^', color=c, ms=7, capsize=3,
-                        label=fr"real $p_z$={p}")
-
-        if not full_range:
-            plt.xlim(-0.2, w_max * 1.15)
-
-        plt.xlabel(r'$\omega$')
-        plt.ylabel(r'$\Delta\mathfrak{M}(\omega)$')
-        plt.title(f'FM = {get_fermion(fm)}')
-        plt.legend(fontsize=10, ncol=2)
-        suffix = '_full' if full_range else ''
-        plt.savefig(os.path.join(IMG_DIR, f'M_real_vs_synthetic_combined_FM_{fm}{suffix}.png'),
-                    format='png', dpi=PLOT_DPI)
-        plt.close()
-
-
-    def plot_RS(df_g, df_M, fm, full_range=False):
-        all_p = sorted(df_g.P.unique())
-        ncols = 3
-        nrows = int(np.ceil(len(all_p) / ncols))
-        fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4.5 * nrows),
-                                dpi=PLOT_DPI, squeeze=False)
-        est_full = df_M[df_M.FM == fm].sort_values(['P', 'W'])
-
-        for ax, p in zip(axes.flat, all_p):
-            r = df_g[df_g.P == p].sort_values('W')
-            s = est_full[est_full.P == p].sort_values('W')
-
-            ax.plot(s.W, s.Est_M, '-', color='tab:orange', lw=2, label='synthetic', zorder=1)
-            ax.errorbar(r.W, r.Mean_M, yerr=r.Std_M, fmt='^', color='tab:blue', ms=7,
-                        capsize=3, label='real', zorder=2)
-
-            if not full_range:
-                ax.set_xlim(-0.2, r.W.max() * 1.15)
-                in_view = s[s.W <= r.W.max() * 1.15]
-                lo = min(r.Mean_M.min(), in_view.Est_M.min())
-                hi = max(r.Mean_M.max(), in_view.Est_M.max())
-                pad = 0.1 * (hi - lo or 1.0)
-                ax.set_ylim(lo - pad, hi + pad)
-
-            ax.set_title(fr'$p_z$={p}')
-            ax.set_xlabel(r'$\omega$')
-            ax.set_ylabel(r'$\Delta\mathfrak{M}(\omega)$')
-            ax.legend(fontsize=11)
-
-        for ax in axes.flat[len(all_p):]:
-            ax.set_visible(False)
-
-        fig.suptitle(f'FM = {get_fermion(fm)}')
-        fig.tight_layout()
-        suffix = '_full' if full_range else ''
-        fig.savefig(os.path.join(IMG_DIR, f'M_real_vs_synthetic_FM_{fm}{suffix}.png'),
-                    format='png', dpi=PLOT_DPI)
-        plt.close(fig)
-
     
     df_real = pd.read_csv(os.path.join(DATA_DIR, 'All_p_w_m.csv'))
     params, I_parts, M_parts = [], [], []
     omega = np.round(np.arange(0.0, 20.0 + 1e-9, 0.1), 10)
+    pl_fm = {'9':[3], '12':[3], '15':[3]} #3,2,2
 
     for fm in sorted(df_real.FM.unique()):
-        result = fit_fm(fm, df_real)
+        result = fit_fm(fm, df_real, pl_fm[str(fm)])
         params.append(result)
+        
+        I = result["A"] * omega * np.exp(-result["slope"] * omega)*0.05
+        I_parts.append(pd.DataFrame({'FM': int(fm), 'W': omega, 'I': I}))
+
         print(
-            f"FM {fm}: A={result['A']:.3f} slope={result['slope']:.3f} "
+            f"FM {fm}: I_max={max(I):.3f}  A={result['A']:.3f} slope={result['slope']:.3f} "
             f"gamma={result['gamma']:.3f} c={result['c']:.4f} "
             f"chi2/dof={result['chi2_dof']:.0f} MAE={result['mae']:.4f} "
             f"pull [{result['pull_min']:.0f}, {result['pull_max']:.0f}]"
         )
 
-        I = result["A"] * omega * np.exp(-result["slope"] * omega)
-        I_parts.append(pd.DataFrame({'FM': int(fm), 'W': omega, 'I': I}))
-
-        df_M_fm = pd.concat([
-            pd.DataFrame({'P': int(P), 'W': omega,
-                          'Est_M': predict(omega, P, result["A"], result["slope"], result["gamma"],
-                                           result["c"], result["z2_max"]),
-                          'FM': int(fm)})
-            for P in sorted(df_real[df_real.FM == fm].P.unique())
-        ], ignore_index=True)
-        M_parts.append(df_M_fm)
-
-        df_g = real_mean_M(df_real, fm)
-        plot_RS_combined(df_g, df_M_fm, fm)
-        plot_RS_combined(df_g, df_M_fm, fm, full_range=True)
-        plot_RS(df_g, df_M_fm, fm)
-        plot_RS(df_g, df_M_fm, fm, full_range=True)
-
-    pd.DataFrame(params).to_csv(os.path.join(DATA_DIR, 'fitted_M_omega_I_params.csv'), index=False)
-    pd.concat(M_parts, ignore_index=True).to_csv(os.path.join(DATA_DIR, 'new_M.csv'), index=False)
-    pd.concat(I_parts, ignore_index=True).to_csv(os.path.join(DATA_DIR, 'rpitd', 'I_vs_omega.csv'), index=False)
+    pd.concat(I_parts, ignore_index=True).to_csv(os.path.join(DATA_DIR, 'rpitd', 'ITD.csv'), index=False)
 
 
 def _parse_args():
@@ -1537,8 +1453,8 @@ if __name__ == '__main__':
 
         # alpha/beta/gamma come from abg_config (see preview_alpha_beta) -- no
         # search, and no diagnose_fit_methods() comparison plots/CSV anymore.
-        # generate_m_omega_from_I_omega()
-        generate_m_omega_and_I_omega()
+        generate_I_omega()
+        generate_m_omega_from_I_omega()
         find_distribution_of_real_data()
         check_M_distribution()
         #plot_mean_vs_median()
