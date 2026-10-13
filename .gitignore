@@ -36,11 +36,6 @@ env/
 model/
 Model/
 
-# v2026 experiment (local only)
-Helicity/v2026/
-Helicity/Data/v2026/
-Helicity/model/v2026/
-
 # Claude Code
 CLAUDE.md
 .claude/

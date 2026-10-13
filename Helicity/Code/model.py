@@ -7,8 +7,6 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.base import clone, BaseEstimator, RegressorMixin
 from sklearn import pipeline
-import sklearn
-import xgboost
 from xgboost import XGBRegressor
 from skopt import BayesSearchCV
 from skopt.space import Real, Integer

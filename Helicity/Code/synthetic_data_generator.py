@@ -1,32 +1,35 @@
-"""Generate M(omega, P) matrix elements and an I(omega) curve per ensemble.
+"""Generate synthetic M(omega, P) replicas per lattice ensemble (``FM`` = 9 / 12 / 15).
 
-Stages, all per lattice ensemble (``FM`` = 09 / 12 / 15):
+Stages run by ``__main__``:
 
 1. ``create_combined_data`` -- concatenate the raw per-momentum RpITD files
    into ``Data/2026/All_p_w_m.csv`` (with a single omega=0 anchor per (FM, P)),
    keeping only the ``N_OMEGA_PER_FM[fm]`` smallest omega values per (FM, P).
 
-2. ``generate_m_omega_and_I_omega`` (used by ``__main__``) -- for each FM, a
-   weighted least-squares fit of the real per-(P, omega) mean M to
+2. ``generate_I_omega`` -- per FM, a weighted least-squares fit of the real
+   per-(P, omega) mean M to
        M(omega, P) = A * omega * exp(-slope * omega) * P**(-gamma) * exp(c * z2),
        z2 = min((omega / P)**2, z2_max),
-   evaluated on omega = 0..20 into ``new_M.csv``, with
-   I(omega) = A * omega * exp(-slope * omega) written to ``rpitd/I_vs_omega.csv``.
+   giving I(omega) = A * omega * exp(-slope * omega) (scaled) on omega = 0..20,
+   written to ``rpitd/ITD.csv``.
 
-3. ``generate_m_omega_from_distribution`` -- draw synthetic Exp replicas of M
-   around ``new_M.csv`` using a linear std(omega) model.
+3. ``generate_m_omega_from_I_omega`` -- per FM, derive M(omega, P) from I(omega)
+   so that every momentum pair reconstructs the same I:
+     a. fit mi = M(omega, P=i), mj = M(omega, P=j) (pair ``FIT_PAIR``) by
+        gradient descent on  I = (j^2 * mj - i^2 * mi) / (j^2 - i^2),
+        seeded from ``mi = alpha * I``, ``mj = beta * I`` (``abg_config``);
+     b. every other P from the closed form  m_k = ((k^2 - i^2) * I + i^2 * mi) / k^2.
+   Writes ``new_M.csv`` (omega = 0..20).
 
-The older alpha/beta method, ``generate_m_omega_from_I_omega`` (no longer
-called by ``__main__``), works as follows -- for each FM:
-     a. read that FM's fitted I(omega) line (`ITD_FILE`, one per FM) and interpolate it onto the real omega
-        grid of that ensemble;
-     b. fit mi = M(omega, P=i) and mj = M(omega, P=j) where j>i>0, by gradient descent on
-            I = ((j^2 * mj) - (i^2 * mi)) / (j^2 - i^2)
-        seeded from ``mi = alpha * I(omega)``, ``mj = beta``;
-     c. derive the higher moments (mj, j>i) from mi via
-            mj = ((j^2 - i^2) * I + (i^2*mi)) / j^2 ;
-     d. search for the (alpha, beta) that minimise the absolute difference
-        between the generated and the real mean M at the matched omega values.
+4. Diagnostics of the real data (distribution shape, linearity of mean/std
+   vs omega) -- CSVs and plots only, nothing downstream reads them.
+
+5. ``generate_m_omega_from_distribution`` -- draw synthetic Exp replicas of M
+   around ``new_M.csv`` with a linear std(omega) model, written to
+   ``generated_Synthetic_exp_data.csv`` (read by prepare_train_test_data.py).
+
+``--fm/--alpha/--beta`` instead previews hand-picked alpha/beta for one FM
+(``preview_alpha_beta``) without touching the pipeline outputs.
 
 Run with ``Helicity/Code`` as the working directory:  ``python synthetic_data_generator.py``
 """
@@ -40,9 +43,8 @@ import pandas as pd
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from scipy import stats
-from scipy.optimize import minimize
-from scipy.signal import savgol_filter
 from scipy.optimize import least_squares
+from scipy.signal import savgol_filter
 
 warnings.filterwarnings("ignore")
 pd.options.mode.chained_assignment = None
@@ -61,22 +63,11 @@ IMG_DIR = f'../Data/{VERSION}/Images/'
 # fitted I(omega) lines the synthetic M is built from, one per FM (csv: W, FM, I(W))
 ITD_FILE = os.path.join(DATA_DIR, 'rpitd', 'ITD.csv')
 
+# Hand-picked (see preview_alpha_beta) seeds for fit_mi_mj, per FM.
 abg_config = {
-    '09':{
-        'alpha': 7.5,
-        'beta': 0.0,
-        'gamma': 0.0,
-    },
-    '12':{
-            'alpha': 6.5,
-            'beta': 0.0,
-            'gamma': 0.0,
-        },
-    '15':{
-            'alpha': 5.5,
-            'beta': 0.0,
-            'gamma': 0.0,
-        },
+    '09': {'alpha': 7.5, 'beta': 0.0, 'gamma': 0.0},
+    '12': {'alpha': 6.5, 'beta': 0.0, 'gamma': 0.0},
+    '15': {'alpha': 5.5, 'beta': 0.0, 'gamma': 0.0},
 }
 
 # Number of real omega values kept per (FM, P): the smallest ones, i.e. Wilson-line
@@ -187,36 +178,10 @@ def real_mean_M(data, fm):
     return df_g
 
 
-def plot_p_w_m_curves(data=None):
-    if data is None:
-        data = pd.read_csv(os.path.join(DATA_DIR, 'All_p_w_m.csv'))
-
-    for fm in data['FM'].unique():
-        df_g = real_mean_M(data, fm)
-
-        plt.figure(dpi=PLOT_DPI)
-        for p in sorted(df_g.P.unique()):
-            t = df_g[df_g.P == p]
-            plt.plot(t.W, t.Mean_M, '-o', label=fr"$p_z$={p}")
-
-        plt.xlabel(r'$\omega$')
-        plt.ylabel(r'$\Delta\mathfrak{M}(\omega)$')
-        plt.title(f'FM={fm}')
-        plt.legend()
-        plt.savefig(os.path.join(IMG_DIR, f'P_W_M_curves_FM_{fm}.png'), format='png', dpi=PLOT_DPI)
-        plt.close()
-
-def get_FM(fm):
-    if fm==9: return '0.09'
-    elif fm==12: return '0.12'
-    elif fm==15: return '0.15'
-
-    return str(round(fm/100, 2))
-
 def plot_I_omega(df_I):
     plt.figure(dpi=PLOT_DPI)
     for fm in sorted(df_I.FM.unique()):
-        plt.plot(df_I[df_I.FM==fm].W, df_I[df_I.FM==fm].I, '-o', label=f'FM={get_FM(fm)}')
+        plt.plot(df_I[df_I.FM==fm].W, df_I[df_I.FM==fm].I, '-o', label=f'FM={fm / 100:.2f}')
     plt.xlabel(r'$\omega$')
     plt.ylabel(r'$\Delta \mathcal{I}(\omega)$')
     plt.legend()
@@ -225,8 +190,7 @@ def plot_I_omega(df_I):
 
 
 def load_itd():
-    """Read ``ITD_FILE`` (csv with header ``W,FM,I(W)``) as columns ``W, FM, I``."""
-    #df_I = pd.read_csv(ITD_FILE, header=None, sep=' ')
+    """Read ``ITD_FILE`` (written by ``generate_I_omega``) as columns ``FM, W, I``."""
     df_I = pd.read_csv(ITD_FILE)
     df_I.columns = ['FM', 'W', 'I']
     df_I['FM'] = df_I['FM'].astype(int)
@@ -235,7 +199,7 @@ def load_itd():
 
 def itd_for_fm(df_I, fm):
     """``(W, I)`` arrays of the I(omega) line for ensemble ``fm`` (e.g. 9 or '09')."""
-    g = df_I[df_I.FM == int(fm)].copy() #
+    g = df_I[df_I.FM == int(fm)]
     if g.empty:
         raise ValueError(f'{ITD_FILE} has no I(omega) rows for FM={fm} '
                          f'(available: {sorted(df_I.FM.unique())}).')
@@ -251,23 +215,12 @@ def fit_mi_mj(I_omega, alpha, beta, i=FIT_PAIR[0], j=FIT_PAIR[1], record_loss=Fa
     ``I_omega`` is a 1-D array of I values.  The seed is ``mi = alpha * I``,
     ``mj = beta * I``.  All omega points are optimised together (they are
     independent).  Returns ``(mi, mj)`` arrays; if ``record_loss`` also returns
-    a long-form DataFrame with per-epoch loss (needs ``omega`` for labelling).
+    a long-form DataFrame with per-epoch loss (``omega`` labels its rows and
+    must be the grid ``I_omega`` is sampled on).
 
-    ``record_loss`` defaults to False: every caller except the one explicit
-    "per-epoch loss trace" call in ``generate_m_omega_from_I_omega`` (which
-    passes both ``record_loss=True`` and ``omega=``) relies on this default --
-    notably ``estimate_M`` and ``_fit``'s ``objective`` (the latter runs this
-    thousands of times per optimisation), neither of which pass ``omega``, so
-    a True default crashes them (``zip(None, ...)``).
-
-    Both seeds scale with ``I`` (not just ``mi``'s) so the whole trajectory
-    -- not just the endpoint -- passes through (0, 0) as ``I -> 0``: a flat
-    ``mj = beta`` seed stays at ``beta`` regardless of how small ``I`` is,
-    so with the limited (100-epoch) convergence budget below, nearby-omega
-    points land close to that nonzero seed, producing a visible jump against
-    ``estimate_M``'s explicit ``M(omega=0)=0`` anchor. Proportional seeding
-    removes the discontinuity at its source rather than patching the one
-    boundary point.
+    Both seeds scale with ``I`` so the whole trajectory passes through (0, 0)
+    as ``I -> 0``; a flat ``mj = beta`` seed would leave a visible jump next
+    to ``estimate_M``'s ``M(omega=0) = 0`` anchor given the 100-epoch budget.
     """
     _check_pair(i, j)
     Ai, Bj = _ab_for_pair(i, j)
@@ -328,156 +281,6 @@ def estimate_M(omega, I_omega, n_p, alpha, beta, gamma=0.0, i=FIT_PAIR[0], j=FIT
     df['P'] = df['P'].astype(int)
     df['Wkey'] = _w_key(df['W'])
     return df
-
-
-def _p_weights(df_real_g, p_weight_exp):
-    """Per-point weight  w = (1 / RMS_P) * P**p_weight_exp  (option D).
-
-    ``1/RMS_P`` puts every momentum on an equal footing regardless of its
-    magnitude; ``P**p_weight_exp`` then tilts the fit toward higher P
-    (exp=0 -> equal per-P, exp=1/2 -> progressively favour large P).
-    """
-    rms = df_real_g.groupby('P')['Mean_M'].apply(lambda s: float(np.sqrt(np.mean(s ** 2))))
-    return df_real_g['P'].map(lambda p: (1.0 / rms[p]) * float(p) ** p_weight_exp).to_numpy()
-
-
-def match_real_and_estimated_M(df_real_g, df_est, weights=None):
-    """(weighted) sum of |Mean_M - Est_M| over shared omega values, plus the count.
-
-    ``weights`` -- optional array aligned with ``df_real_g`` rows; when given the
-    absolute differences are weighted by it before summing.
-    """
-    real = df_real_g[['P', 'Wkey', 'Mean_M']].copy()
-    real['_w'] = 1.0 if weights is None else np.asarray(weights, dtype=float)
-    merged = pd.merge(real, df_est, on=['P', 'Wkey'], how='inner')
-    diff = float(np.sum(merged['_w'] * np.abs(merged['Mean_M'] - merged['Est_M'])))
-    return diff, len(merged)
-
-
-def _fit(df_real_g, omega, I_omega, n_p, seeds, use_gamma, weights, monotonic_penalty=0.0,
-         i=FIT_PAIR[0], j=FIT_PAIR[1]):
-    """Multi-start Nelder-Mead core shared by the fit_* functions.
-
-    ``i, j`` (default ``FIT_PAIR``) -- the directly-fit momentum pair (see ``estimate_M``).
-
-    The objective is evaluated with plain numpy (no per-iteration DataFrame
-    build) since it runs thousands of times.
-
-    ``monotonic_penalty`` (0 = off) adds ``penalty * sum(max(0, rel[p+1] -
-    rel[p])**2)`` over consecutive P, where ``rel[p]`` is P's RMS-relative
-    error (as in ``_per_p_rel_rms``) -- i.e. it pushes the search away from
-    any (alpha, beta) where a *higher* P fits worse than the P below it.
-    Needed because P not in {i, j} are algebraically derived from mi/I with
-    no separate free parameter (see ``generate_m_omega_from_I_omega``'s
-    docstring): the per-P weight alone shifts the P=i-vs-P=j balance but
-    cannot on its own guarantee a strict best-at-highest-P ordering overall.
-    """
-    y = np.asarray(I_omega, dtype=float)
-    y_zero = y == 0.0
-    key_to_pos = {int(k): idx for idx, k in enumerate(_w_key(omega))}
-
-    # df_real_g carries a RangeIndex (real_mean_M resets it), so weights[] aligns
-    # by position and survives the Wkey filter below.
-    mask = df_real_g['Wkey'].isin(key_to_pos).to_numpy()
-    real = df_real_g[mask]
-    pos = real['Wkey'].map(key_to_pos).to_numpy()          # omega-grid index per real point
-    P = real['P'].to_numpy(dtype=float)
-    real_M = real['Mean_M'].to_numpy(dtype=float)
-    w = np.ones(mask.sum()) if weights is None else np.asarray(weights, dtype=float)[mask]
-    P_sorted = np.sort(np.unique(P))
-    p_masks = [P == p for p in P_sorted] if monotonic_penalty > 0.0 else None
-
-    def objective(params):
-        if use_gamma:
-            alpha, beta, gamma = params
-        else:
-            alpha, beta = params
-            gamma = 0.0
-        if len(pos) == 0:
-            return np.inf
-        mi, mj = fit_mi_mj(y, alpha, beta, i, j)
-        mi = np.where(y_zero, 0.0, mi)[pos]
-        mj = np.where(y_zero, 0.0, mj)[pos]
-        yi = y[pos]
-        derived = ((P ** 2 - i * i) * yi + (i * i) * mi) / (P ** 2) * np.exp(-gamma * np.maximum(P - j, 0))
-        est = np.where(P == float(i), mi, np.where(P == float(j), mj, derived))
-        total = float(np.sum(w * np.abs(real_M - est)))
-
-        if monotonic_penalty > 0.0:
-            rel = np.empty(len(P_sorted))
-            for idx, m in enumerate(p_masks):
-                denom = np.sqrt(np.mean(real_M[m] ** 2))
-                rel[idx] = np.sqrt(np.mean((real_M[m] - est[m]) ** 2)) / denom if denom > 0 else 0.0
-            violation = np.maximum(0.0, rel[1:] - rel[:-1])
-            total += monotonic_penalty * float(np.sum(violation ** 2))
-        return total
-
-    best = None
-    for x0 in seeds:
-        res = minimize(objective, x0=list(x0), method='Nelder-Mead',
-                       options={'xatol': 1e-4, 'fatol': 1e-12, 'maxiter': 4000})
-        if best is None or res.fun < best.fun:
-            best = res
-    return best
-
-
-def fit_alpha_beta(df_real_g, omega, I_omega, n_p, i=FIT_PAIR[0], j=FIT_PAIR[1]):
-    """Baseline: (alpha, beta) minimising the unweighted sum |Mean_M - Est_M|.
-
-    ``i, j`` (default ``FIT_PAIR``) -- the directly-fit momentum pair (see ``estimate_M``).
-    """
-    # beta now scales I (fit_mi_mj's mj seed is beta*I, not a flat constant),
-    # so it plays the same role as alpha and needs the same seed range.
-    seeds = [(a, b) for a in (1.0, 10.0, 50.0, 310.0, 1000.0) for b in (1.0, 10.0, 50.0, 310.0, 1000.0)]
-    best = _fit(df_real_g, omega, I_omega, n_p, seeds, use_gamma=False, weights=None, i=i, j=j)
-    return float(best.x[0]), float(best.x[1]), float(best.fun)
-
-
-def fit_alpha_beta_weighted(df_real_g, omega, I_omega, n_p, p_weight_exp=0.5, i=FIT_PAIR[0], j=FIT_PAIR[1]):
-    """Option D: (alpha, beta) under the per-P weight ``(1/RMS_P) * P**p_weight_exp``.
-
-    Same 2-parameter ansatz as ``fit_alpha_beta`` -- only the objective weighting
-    changes, so this shows how far re-weighting alone can shift the fit toward
-    high P. ``i, j`` (default ``FIT_PAIR``) -- the directly-fit momentum pair.
-    """
-    weights = _p_weights(df_real_g, p_weight_exp)
-    seeds = [(a, b) for a in (1.0, 10.0, 50.0, 310.0, 1000.0) for b in (1.0, 10.0, 50.0, 310.0, 1000.0)]
-    best = _fit(df_real_g, omega, I_omega, n_p, seeds, use_gamma=False, weights=weights, i=i, j=j)
-    return float(best.x[0]), float(best.x[1]), float(best.fun)
-
-
-def fit_alpha_beta_monotonic(df_real_g, omega, I_omega, n_p, p_weight_exp=0.5, monotonic_penalty=200.0,
-                              i=FIT_PAIR[0], j=FIT_PAIR[1]):
-    """(alpha, beta) minimising the P-weighted L1 error subject to a strict
-    best-fit-at-highest-P ordering (see ``_fit``'s ``monotonic_penalty``).
-
-    ``i, j`` (default ``FIT_PAIR``) -- the directly-fit momentum pair. P-weighting
-    alone (``fit_alpha_beta_weighted``) shifts the P=i-vs-P=j balance but
-    does not reliably make the rest of the P's relative error decrease
-    monotonically -- empirically it can go either way depending on alpha's
-    scale, since those moments are a fixed function of mi/I with no
-    separate free parameter. This adds an explicit penalty for any ordering
-    violation so the search is pushed toward a genuinely monotonic fit.
-    """
-    weights = _p_weights(df_real_g, p_weight_exp)
-    seeds = [(a, b) for a in (1.0, 5.0, 10.0, 20.0, 50.0, 100.0)
-             for b in (-50.0, -20.0, -5.0, 0.0, 5.0, 20.0, 50.0)]
-    best = _fit(df_real_g, omega, I_omega, n_p, seeds, use_gamma=False, weights=weights,
-                monotonic_penalty=monotonic_penalty, i=i, j=j)
-    return float(best.x[0]), float(best.x[1]), float(best.fun)
-
-
-def fit_alpha_beta_gamma(df_real_g, omega, I_omega, n_p, p_weight_exp=0.0, i=FIT_PAIR[0], j=FIT_PAIR[1]):
-    """Option A: (alpha, beta, gamma) with the high-P damping term in ``estimate_M``.
-
-    Uses the per-P weight (default exp=0, i.e. 1/RMS_P) so gamma is driven by the
-    high-P shape rather than swamped by the large P=i residuals. ``i, j``
-    (default ``FIT_PAIR``) -- the directly-fit momentum pair.
-    """
-    weights = _p_weights(df_real_g, p_weight_exp)
-    seeds = [(a, b, g) for a in (10.0, 50.0, 300.0) for b in (10.0, 50.0, 300.0) for g in (0.0, 0.3, 0.8)]
-    best = _fit(df_real_g, omega, I_omega, n_p, seeds, use_gamma=True, weights=weights, i=i, j=j)
-    return float(best.x[0]), float(best.x[1]), float(best.x[2]), float(best.fun)
 
 
 def _fit_title(fm, alpha, beta, gamma):
@@ -572,11 +375,9 @@ def generate_m_omega_from_I_omega(i=FIT_PAIR[0], j=FIT_PAIR[1]):
     ``i, j`` (default ``FIT_PAIR``, ``j>i>=2``) -- the directly-fit momentum pair for
     every FM (see ``estimate_M``); every other P's moment is derived from it.
 
-    ``alpha``/``beta``/``gamma`` are no longer searched for -- every FM present
-    in ``All_p_w_m.csv`` must have an entry in the module-level ``abg_config``
-    dict (keyed by the zero-padded FM string, e.g. ``'09'``), typically
-    hand-picked with ``preview_alpha_beta``. A FM missing from ``abg_config``
-    raises ``ValueError`` rather than silently fitting one.
+    Every FM in ``All_p_w_m.csv`` must have an ``abg_config`` entry (keyed by
+    the zero-padded FM string, e.g. ``'09'``), typically hand-picked with
+    ``preview_alpha_beta``; a missing one raises ``ValueError``.
 
     With ``gamma=0`` (``abg_config``'s default), every derived (P not in
     {i, j}) moment is exactly m_k = ((k^2-i^2)*I + i^2*mi) / k^2, the algebraic
@@ -612,19 +413,13 @@ def generate_m_omega_from_I_omega(i=FIT_PAIR[0], j=FIT_PAIR[1]):
         alpha, beta, gamma = cfg['alpha'], cfg['beta'], cfg.get('gamma', 0.0)
 
         # per-epoch loss trace for the mi/mj gradient descent
-        _, _, df_loss = fit_mi_mj(I_itd, alpha, beta, i, j, record_loss=True, omega=omega)
+        _, _, df_loss = fit_mi_mj(I_itd, alpha, beta, i, j, record_loss=True, omega=W_itd)
         df_loss.to_csv(os.path.join(DATA_DIR, f'loss_val_FM_{fm}.csv'), index=False)
 
         # real-vs-estimated comparison uses only the matched (sparse) omega grid
         est = estimate_M(omega, I_omega, n_p, alpha, beta, gamma, i=i, j=j)
         df_cmp = pd.merge(df_g, est, on=['P', 'Wkey'], how='inner', suffixes=('', '_est'))
         df_cmp = df_cmp[['P', 'W', 'Mean_M', 'Est_M']].sort_values(['P', 'W'])
-
-        # no search objective to report anymore -- the same unweighted metric
-        # fit_alpha_beta used to minimise, kept for a comparable number in the
-        # summary CSV/print below.
-        obj, _ = match_real_and_estimated_M(df_g, est)
-
         df_cmp.to_csv(os.path.join(DATA_DIR, f'M_real_vs_est_FM_{fm}.csv'), index=False)
 
         # new_M is evaluated on the full ITD omega grid (0..20), not just the
@@ -640,10 +435,11 @@ def generate_m_omega_from_I_omega(i=FIT_PAIR[0], j=FIT_PAIR[1]):
         plot_real_vs_synthetic_combined(df_g, est_full, fm, alpha, beta, full_range=True, gamma=gamma)
 
         n_matched = len(df_cmp)
-        mean_abs = np.abs(df_cmp['Mean_M'] - df_cmp['Est_M']).mean()
+        abs_diff = np.abs(df_cmp['Mean_M'] - df_cmp['Est_M'])
+        mean_abs = abs_diff.mean()
         summary.append({
             'FM': fm, 'alpha': alpha, 'beta': beta, 'gamma': gamma,
-            'objective': obj, 'n_matched': n_matched, 'mean_abs_diff': mean_abs,
+            'objective': abs_diff.sum(), 'n_matched': n_matched, 'mean_abs_diff': mean_abs,
         })
         print(f'FM={fm}: alpha={alpha:.5g}, beta={beta:.5g}, '
               f'gamma={gamma:.5g}, mean|dM|={mean_abs:.5g} over {n_matched} points')
@@ -666,9 +462,8 @@ def _per_p_rel_rms(df_real_g, est):
 def preview_alpha_beta(fm, alpha, beta, gamma=0.0, i=FIT_PAIR[0], j=FIT_PAIR[1], tag='_manual'):
     """Hand-tune (alpha, beta[, gamma]) for one FM and see the effect immediately.
 
-    Skips ``create_combined_data`` and the ``fit_alpha_beta*`` search entirely --
-    it just reloads ``All_p_w_m.csv``/``rpitd/ITD.csv`` (already on disk
-    after one run of ``generate_m_omega_from_I_omega``), builds ``estimate_M`` at
+    Reloads ``All_p_w_m.csv``/``rpitd/ITD.csv`` (already on disk after one
+    pipeline run), builds ``estimate_M`` at
     the values you pass in, prints the per-P fit quality, and rewrites
     ``M_real_vs_synthetic*_FM_{fm}{tag}*.png`` (``tag`` defaults to ``'_manual'``
     so these never overwrite the pipeline's own ``M_real_vs_synthetic*_FM_{fm}.png``
@@ -677,8 +472,8 @@ def preview_alpha_beta(fm, alpha, beta, gamma=0.0, i=FIT_PAIR[0], j=FIT_PAIR[1],
     well enough; nothing here writes ``new_M.csv`` or ``optimal_alpha_beta.csv``,
     so it's safe to explore without disturbing the pipeline's saved fit.
 
-    Only ``mi``/``mj`` (P = i, j; default ``FIT_PAIR`` = 2, 4) are direct functions of
-    alpha/beta -- every other P (including P=1, 3, 5) is the closed-form derived
+    Only ``mi``/``mj`` (P = i, j; default ``FIT_PAIR`` = 2, 3) are direct functions of
+    alpha/beta -- every other P (including P=1, 4, 5) is the closed-form derived
     moment from ``estimate_M``, so alpha/beta move the other P only indirectly
     through mi/I; ``gamma`` (default 0, i.e. off) is the other knob available,
     damping just the derived moments -- see ``estimate_M``'s docstring.
@@ -726,185 +521,20 @@ def preview_alpha_beta(fm, alpha, beta, gamma=0.0, i=FIT_PAIR[0], j=FIT_PAIR[1],
     return df_cmp, per_p
 
 
-def diagnose_fit_methods():
-    """Compare the baseline fit, option D (re-weighting only) and option A (gamma).
+def _fit_std_model(w_real, std_real):
+    """Linear  std(omega) = slope*omega + intercept, as a callable of omega.
 
-    Prints a per-P relative-RMS table per ensemble and writes
-    ``Data/2026/fit_method_comparison.csv`` plus one
-    ``M_real_vs_synthetic_combined_FM_{fm}_{baseline,Dexp*,Agamma}.png`` per FM.
-
-    No longer called from ``__main__`` -- now that ``generate_m_omega_from_I_omega``
-    reads alpha/beta/gamma from ``abg_config`` instead of fitting them, these
-    search-based comparisons aren't part of the regular pipeline run; call this
-    manually (e.g. from a notebook/REPL) if you want to re-run the search anyway,
-    for a new ensemble or to sanity-check an ``abg_config`` value.
-    """
-    df_I = load_itd()
-    data = pd.read_csv(os.path.join(DATA_DIR, 'All_p_w_m.csv'))
-
-    rows = []
-    for fm in sorted(data.FM.unique()):
-        df_g = real_mean_M(data, fm)
-        n_p = int(df_g.P.nunique())
-        omega = np.sort(df_g['W'].unique())
-        W_itd, I_itd = itd_for_fm(df_I, fm)
-        I_omega = np.interp(omega, W_itd, I_itd)
-
-        runs = {}
-        a, b, _ = fit_alpha_beta(df_g, omega, I_omega, n_p)
-        runs['baseline'] = (a, b, 0.0)
-        for k in (0.0, 0.5, 1.0):
-            a, b, _ = fit_alpha_beta_weighted(df_g, omega, I_omega, n_p, p_weight_exp=k)
-            runs[f'D exp={k}'] = (a, b, 0.0)
-        a, b, gm, _ = fit_alpha_beta_gamma(df_g, omega, I_omega, n_p)
-        runs['A gamma'] = (a, b, gm)
-
-        print(f'\nFM={fm}   per-P relative RMS  (RMS|Δ| / RMS|real|)')
-        print(f"  {'method':10s} {'alpha':>8s} {'beta':>6s} {'gamma':>6s}   " +
-              '  '.join(f'P{p}' for p in range(1, n_p + 1)))
-        for name, (a, b, gm) in runs.items():
-            est = estimate_M(omega, I_omega, n_p, a, b, gm)
-            rel = _per_p_rel_rms(df_g, est)
-            print(f"  {name:10s} {a:8.2f} {b:6.2f} {gm:6.2f}   " +
-                  '  '.join(f'{rel.get(p, float("nan")):.2f}' for p in range(1, n_p + 1)))
-            rows.append({'FM': fm, 'method': name, 'alpha': a, 'beta': b, 'gamma': gm,
-                         **{f'relRMS_P{p}': rel.get(p) for p in range(1, n_p + 1)}})
-
-            est_full = estimate_M(W_itd, I_itd, n_p, a, b, gm)
-            tag = '_' + name.replace(' ', '').replace('=', '')
-            plot_real_vs_synthetic_combined(df_g, est_full, fm, a, b, gamma=gm, tag=tag)
-
-    pd.DataFrame(rows).to_csv(os.path.join(DATA_DIR, 'fit_method_comparison.csv'), index=False)
-
-
-def _fit_std_model(w_real, std_real, cap=True):
-    """Linear  std(omega) = slope*omega + intercept.
-
-    ``cap=True`` (default) clips to ``[min(std_real), 3*max(std_real)]`` so a
-    long extrapolation can't run away -- used by
-    ``find_distribution_of_real_data`` where the full omega grid is only
-    ~2-5x the real omega range. ``cap=False`` only floors at a tiny positive
-    value (so sigma stays valid) and otherwise lets the line keep growing --
-    a genuine linear extrapolation, for ``extrapolate_std_to_new_M`` where the
-    full grid reaches ~10x the real omega range and flattening it would
-    defeat the point of extrapolating at all.
+    Only floored at a tiny positive value (so sigma stays valid); otherwise
+    the line keeps growing, since the full 0..20 grid reaches ~10x the real
+    omega range and capping it would defeat the extrapolation.
     """
     slope, intercept = np.polyfit(w_real, std_real, 1)
-    lo = float(np.min(std_real)) if cap else 1e-6 * float(np.max(std_real))
-    hi = 3.0 * float(np.max(std_real)) if cap else np.inf
+    lo = 1e-6 * float(np.max(std_real))
 
     def model(w):
-        return np.clip(slope * np.asarray(w, dtype=float) + intercept, lo, hi)
+        return np.clip(slope * np.asarray(w, dtype=float) + intercept, lo, None)
 
-    return model, float(slope), float(intercept)
-
-
-def find_distribution_of_real_data(omega_grid='full', seed=12345, make_plots=True):
-    """Per (FM, P): characterise the Exp-to-Exp scatter of the real data and use
-    that same distribution to spread the synthetic mean curve (``new_M.csv``)
-    into ``n`` replicas -- ``n`` = the real Exp count for that (FM, P).
-
-    Model (verified against the real data)
-    --------------------------------------
-    The standardised residual  z = (M_exp(w) - mean(w)) / std(w)  is ~ N(0, 1)
-    with the *same* distribution at every omega (skew ~ 0, excess kurtosis ~ 0),
-    and  std(w)  grows almost linearly with omega.  The real Exp replicas are
-    correlated across omega (rho ~ 0.9).  So per (FM, P):
-
-      * fit  std(w) ~ slope*w + intercept  to the real per-omega std;
-      * draw  z_i(w) = sqrt(rho) * u_i + sqrt(1 - rho) * e_i(w)  with
-        u_i, e_i(w) ~ N(0, 1)  -> unit variance, cross-omega correlation rho;
-      * synthetic replica:  M_i(w) = Est_M(w) + z_i(w) * std_model(w),
-        with  M_i(0) = 0  enforced.
-
-    ``omega_grid`` -- ``'full'`` (new_M.csv's 0..20 grid) or ``'real'`` (only the
-    measured omega values, interpolating Est_M onto them).
-
-    Writes ``Data/2026/real_distribution_params.csv`` and
-    ``Data/2026/Synthetic_M_replicas.csv`` (columns FM, P, W, Exp, M).
-    """
-    data = pd.read_csv(os.path.join(DATA_DIR, 'All_p_w_m.csv'))
-    new_M = pd.read_csv(os.path.join(DATA_DIR, 'new_M.csv'))
-
-    params, replicas, checks = [], [], []
-    for (fm, p), t in data[data.W > 0].groupby(['FM', 'P']):
-        piv = t.pivot_table(index='Exp', columns='W', values='M').dropna(axis=1, how='any')
-        n = int(piv.shape[0])
-        w_real = piv.columns.values.astype(float)
-        mean_w = piv.mean().to_numpy()
-        std_w = piv.std().to_numpy()
-
-        z = ((piv.to_numpy() - mean_w) / std_w).ravel()
-        z = z[np.isfinite(z)]
-
-        corr = np.corrcoef(piv.to_numpy().T)
-        rho = float(np.clip(np.nanmean(corr[np.triu_indices_from(corr, 1)]), 0.0, 0.999))
-
-        std_model, slope, intercept = _fit_std_model(w_real, std_w)
-
-        params.append({
-            'FM': fm, 'P': p, 'n_exp': n, 'std_slope': slope, 'std_intercept': intercept,
-            'z_mean': float(z.mean()), 'z_std': float(z.std()),
-            'z_skew': float(stats.skew(z)), 'z_excess_kurtosis': float(stats.kurtosis(z)),
-            'cross_w_corr': rho,
-        })
-
-        # synthetic mean curve on the requested omega grid
-        s = new_M[(new_M.FM == fm) & (new_M.P == p)].sort_values('W')
-        if omega_grid == 'real':
-            w = np.concatenate(([0.0], w_real))
-        else:
-            w = s['W'].to_numpy(dtype=float)
-        est = np.interp(w, s['W'].to_numpy(dtype=float), s['Est_M'].to_numpy(dtype=float))
-
-        rng = np.random.default_rng(seed + int(fm) * 100 + int(p))
-        u = rng.standard_normal((n, 1))
-        e = rng.standard_normal((n, w.size))
-        zmat = np.sqrt(rho) * u + np.sqrt(1.0 - rho) * e
-        M = est[None, :] + zmat * std_model(w)[None, :]
-        M[:, w == 0.0] = 0.0
-
-        replicas.append(pd.DataFrame({
-            'FM': fm, 'P': p,
-            'W': np.tile(w, n),
-            'Exp': np.repeat(np.arange(n), w.size),
-            'M': M.ravel(),
-        }))
-
-        # book-keeping: does the synthetic scatter reproduce the real one?
-        for wi, sr in zip(w_real, std_w):
-            checks.append({'FM': fm, 'P': p, 'W': wi, 'std_real': sr,
-                           'std_model': float(std_model(wi))})
-
-    df_params = pd.DataFrame(params)
-    df_params.to_csv(os.path.join(DATA_DIR, 'real_distribution_params.csv'), index=False)
-    pd.concat(replicas, ignore_index=True).to_csv(
-        os.path.join(DATA_DIR, 'Synthetic_M_replicas.csv'), index=False)
-
-    print('\nreal-data distribution per (FM, P)  [z ~ N(0,1) in all cases]')
-    print(df_params.round(4).to_string(index=False))
-
-    if make_plots:
-        df_chk = pd.DataFrame(checks)
-        for fm, g in df_chk.groupby('FM'):
-            all_p = sorted(g.P.unique())
-            fig, axes = plt.subplots(1, len(all_p), figsize=(5 * len(all_p), 4.5),
-                                     dpi=PLOT_DPI, squeeze=False)
-            for ax, pp in zip(axes.flat, all_p):
-                tp = g[g.P == pp].sort_values('W')
-                ax.plot(tp.W, tp.std_real, '^', label='real std')
-                ax.plot(tp.W, tp.std_model, '-', label='model std')
-                ax.set_title(fr'$p_z$={pp}')
-                ax.set_xlabel(r'$\omega$')
-                ax.set_ylabel(r'std$[\,M(\omega)\,]$')
-                ax.legend(fontsize=10)
-            fig.suptitle(f'FM={fm}   real vs modelled Exp-scatter')
-            fig.tight_layout()
-            fig.savefig(os.path.join(IMG_DIR, f'real_distribution_FM_{fm}.png'),
-                        format='png', dpi=PLOT_DPI)
-            plt.close(fig)
-
-    return df_params
+    return model
 
 
 # Candidate shapes to test the real per-(FM,P,W) M distribution against.
@@ -1033,14 +663,11 @@ def _real_groups(data=None):
 
 
 def _draw_mean_vs_median(ax, groups, title='mean vs median'):
-    """Original diagnostic: mean vs median of M per (FM,P,W).
+    """Mean vs median of M per (FM,P,W).
 
-    Kept for reference, but this only tests *symmetry* -- mean==median holds
-    for any symmetric unimodal distribution (normal, logistic, Laplace,
-    Student-t, uniform...), and with n~1000 the sample mean/median are both so
-    precise that near-perfect agreement is expected regardless of shape. It
-    cannot tell a normal apart from a heavier- or lighter-tailed symmetric
-    alternative -- see ``_draw_qq_normal`` / ``plot_skew_kurtosis`` instead.
+    This only tests *symmetry* (mean==median for any symmetric distribution),
+    so it cannot tell a normal from a heavier- or lighter-tailed one -- see
+    ``_draw_qq_normal`` for that.
     """
     mean = np.array([x.mean() for x in groups.values()])
     median = np.array([np.median(x) for x in groups.values()])
@@ -1072,23 +699,6 @@ def _draw_qq_normal(ax, groups, title='qq-normal'):
     ax.set_title(title)
 
 
-def plot_mean_vs_median(data=None):
-    plt.figure(dpi=PLOT_DPI)
-    _draw_mean_vs_median(plt.gca(), _real_groups(data), title='mean vs median of M, per (FM, P, W)')
-    plt.savefig(os.path.join(IMG_DIR, 'mean_vs_median.png'), format='png', dpi=PLOT_DPI)
-    plt.close()
-
-
-def plot_qq_normal(data=None):
-    groups = _real_groups(data)
-    plt.figure(dpi=PLOT_DPI)
-    _draw_qq_normal(plt.gca(), groups,
-                    title=f'Normal Q-Q plot, standardised M  '
-                          f'({sum(len(x) for x in groups.values())} points pooled over all (FM,P,W))')
-    plt.savefig(os.path.join(IMG_DIR, 'qq_normal_pooled.png'), format='png', dpi=PLOT_DPI)
-    plt.close()
-
-
 def plot_mean_median_and_qq(data=None):
     """Mean-vs-median and the normal Q-Q plot side by side in one figure."""
     groups = _real_groups(data)
@@ -1099,31 +709,6 @@ def plot_mean_median_and_qq(data=None):
     fig.savefig(os.path.join(IMG_DIR, 'mean_median_and_qq.png'), format='png', dpi=PLOT_DPI)
     plt.close(fig)
 
-
-def plot_skew_kurtosis(data=None):
-    """Scatter of (skewness, excess kurtosis) per (FM,P,W) -- normal sits at the
-    origin. Reference markers show where the other candidates from
-    ``check_M_distribution`` would sit (all symmetric -> skew=0, so this is the
-    kurtosis axis that actually separates them; skewness is on the other axis
-    to also catch any asymmetry mean-vs-median would miss).
-    """
-    groups = _real_groups(data)
-    rows = [{'skew': stats.skew(x), 'kurt': stats.kurtosis(x)} for x in groups.values()]
-    df = pd.DataFrame(rows)
-
-    plt.figure(dpi=PLOT_DPI)
-    plt.scatter(df['skew'], df['kurt'], s=14, alpha=0.6, label='(FM,P,W) groups', zorder=3)
-    plt.plot(0, 0, 'k*', ms=20, label='normal', zorder=4)
-    for label, kurt in [('logistic', 1.2), ('laplace', 3.0), ('uniform', -1.2)]:
-        plt.plot(0, kurt, 'x', ms=10, mew=2, label=label, zorder=4)
-    plt.axhline(0, color='gray', lw=0.5)
-    plt.axvline(0, color='gray', lw=0.5)
-    plt.xlabel('skewness')
-    plt.ylabel('excess kurtosis')
-    plt.title('skewness vs excess kurtosis, per (FM, P, W)')
-    plt.legend(fontsize=10)
-    plt.savefig(os.path.join(IMG_DIR, 'skew_vs_kurtosis.png'), format='png', dpi=PLOT_DPI)
-    plt.close()
 
 def _poly_r2(x, y, deg):
     """R^2 of a degree-``deg`` polynomial fit to (x, y); (nan, None) if too few points."""
@@ -1224,9 +809,9 @@ def extrapolate_std_to_new_M(data=None, new_M=None):
     """Step 1-2: extrapolate std(omega) onto new_M.csv's full omega grid.
 
     Per (FM, P), fits the linear ``std(omega) = slope*omega + intercept``
-    model (``_fit_std_model``, clipped to the real std range) to the real
-    data, then evaluates it at every omega in ``new_M.csv`` (0..20, includes
-    omega beyond the real range -- this is the extrapolation).
+    model (``_fit_std_model``) to the real data, then evaluates it at every
+    omega in ``new_M.csv`` (0..20, includes omega beyond the real range --
+    this is the extrapolation).
 
     Writes ``Data/2026/new_M_S.csv`` with columns FM, W, P, Est_M, Est_S.
     """
@@ -1239,7 +824,7 @@ def extrapolate_std_to_new_M(data=None, new_M=None):
     parts = []
     for (fm, p), t in data.groupby(['FM', 'P']):
         std_w = t.groupby('W')['M'].std()
-        model, _, _ = _fit_std_model(std_w.index.to_numpy(dtype=float), std_w.to_numpy(), cap=False)
+        model = _fit_std_model(std_w.index.to_numpy(dtype=float), std_w.to_numpy())
 
         g = new_M[(new_M.FM == fm) & (new_M.P == p)].copy()
         g['Est_S'] = model(g['W'].to_numpy(dtype=float))
@@ -1338,33 +923,29 @@ def generate_m_omega_from_distribution():
     print('N_fm (max real Exp count per FM):', N_fm)
     generate_synthetic_exp_data(new_M_S, N_fm)
 
+
 def generate_I_omega():
-    """Per FM, fit the real per-(P, W) mean M to
+    """Per FM, fit the real per-(P, W) mean M (P in ``pl_fm[fm]``) to
         M(omega, P) = A * omega * exp(-slope * omega) * P**(-gamma) * exp(c * z2),
         z2 = min((omega / P)**2, z2_max)
 
     weighted by 1/SE^2 of each cell mean (omega=0 anchor rows excluded), then
-    evaluate it on the omega = 0..20 grid. ``slope`` is the fit parameter; ``P``
-    is the momentum from the data. Writes ``fitted_M_omega_I_params.csv``,
-    ``new_M.csv`` (FM, P, W, Est_M) and ``rpitd/I_vs_omega.csv`` (FM, W, I with
-    I = A * omega * exp(-slope * omega), i.e. M at P=1 without the z2 term).
+    write  I(omega) = 0.05 * A * omega * exp(-slope * omega)  on omega = 0..20
+    to ``rpitd/ITD.csv`` (FM, W, I) -- the input of ``generate_m_omega_from_I_omega``.
     """
 
     def cells(df, pl):
         g = df.groupby(["P", "W"], as_index=False).M.agg(mean="mean", std="std", n="count")
         g = g[(g.W > 0) & (g.P.isin(pl))].copy()
-        #g = g[g.P.isin([2])].copy()
         g["std"] = g["std"].fillna(0.0).clip(lower=1e-8)
         g["weight"] = g["n"] / g["std"] ** 2
         return g
-
 
     def predict(w, P, A, slope, gamma, c, z2_max):
         z2 = np.minimum((w / P) ** 2, z2_max)
         return A * w * np.exp(-slope * w) * P ** (-gamma) * np.exp(c * z2)
 
-
-    def fit_fm(fm, raw, pl=[1,2,3,4]):
+    def fit_fm(fm, raw, pl):
         sub = raw[raw.FM == fm]
         tab = cells(sub, pl)
         z2_max = float(np.max((tab.W / tab.P) ** 2))
@@ -1372,7 +953,6 @@ def generate_I_omega():
         def residual(th):
             A, slope, gamma, c = th
             model = predict(tab.W.to_numpy(), tab.P.to_numpy(), A, slope, gamma, c, z2_max)
-            #I = A * omega * np.exp(-slope * omega)
             return np.sqrt(tab.weight) * (model - tab["mean"])
 
         fit = least_squares(
@@ -1390,19 +970,15 @@ def generate_I_omega():
                     chi2_dof=chi2 / dof, mae=mae, pull_min=float(pull.min()),
                     pull_max=float(pull.max()), n_cells=len(tab))
 
-    def get_fermion(fm):
-        return f'{(fm/100):0.2f}'
-    
     df_real = pd.read_csv(os.path.join(DATA_DIR, 'All_p_w_m.csv'))
-    params, I_parts, M_parts = [], [], []
+    I_parts = []
     omega = np.round(np.arange(0.0, 20.0 + 1e-9, 0.1), 10)
-    pl_fm = {'9':[3], '12':[3], '15':[3]} #3,2,2
+    pl_fm = {'9': [3], '12': [3], '15': [3]}   # P values each FM's fit uses
 
     for fm in sorted(df_real.FM.unique()):
         result = fit_fm(fm, df_real, pl_fm[str(fm)])
-        params.append(result)
-        
-        I = result["A"] * omega * np.exp(-result["slope"] * omega)*0.05
+
+        I = result["A"] * omega * np.exp(-result["slope"] * omega) * 0.05
         I_parts.append(pd.DataFrame({'FM': int(fm), 'W': omega, 'I': I}))
 
         print(
@@ -1418,7 +994,7 @@ def generate_I_omega():
 def _parse_args():
     parser = argparse.ArgumentParser(
         description='Default (no arguments): run the full synthetic-data pipeline '
-                    '(fit alpha/beta per FM and generate everything downstream of it). '
+                    '(alpha/beta per FM from abg_config). '
                     'Pass --fm together with --alpha/--beta to instead preview a '
                     'hand-picked fit for that one FM via preview_alpha_beta, without '
                     'touching new_M.csv or optimal_alpha_beta.csv.')
@@ -1449,19 +1025,15 @@ if __name__ == '__main__':
         # always rebuild (cheap) so a stale All_p_w_m.csv never outlives a
         # change to N_OMEGA_PER_FM
         data = create_combined_data()
-        plot_p_w_m_curves(data)
 
-        # alpha/beta/gamma come from abg_config (see preview_alpha_beta) -- no
-        # search, and no diagnose_fit_methods() comparison plots/CSV anymore.
         generate_I_omega()
         generate_m_omega_from_I_omega()
-        find_distribution_of_real_data()
+
+        # real-data diagnostics (CSVs/plots only)
         check_M_distribution()
-        #plot_mean_vs_median()
-        #plot_qq_normal()
-        #plot_skew_kurtosis()
-        check_linearity()
-        plot_mean_vs_w()
-        plot_std_vs_w()
-        plot_mean_median_and_qq()
+        check_linearity(data)
+        plot_mean_vs_w(data)
+        plot_std_vs_w(data)
+        plot_mean_median_and_qq(data)
+
         generate_m_omega_from_distribution()
