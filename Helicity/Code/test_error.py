@@ -72,7 +72,7 @@ MODEL_TITLES = {'GB': 'Gradient boosted tree',
                 'GP': 'Gaussian process'}
 VARIANT_TITLE = {'no_exp': 'without Exp feature', 'with_exp': 'with Exp feature'}
 W_DECIMALS = 1
-SMOOTH_WINDOW = 5       # Savitzky-Golay window in grid points (0.1 each)
+SMOOTH_WINDOW = 60       # Savitzky-Golay window in grid points (0.1 each)
 SMOOTH_POLYORDER = 3
 MIN_P = 2                # smallest P allowed in an I(omega) pair; M curves keep every P (incl. P=1)
 N_SEED = 4               # seed-window points per P in reconstruct_real_data.py (N_LAGS)
@@ -109,8 +109,9 @@ def get_mean_std(data, grp_cols, agg_col):
 
 
 class Test_Error:
-    def __init__(self, data_dir='../Data/2026', smooth_window=SMOOTH_WINDOW):
+    def __init__(self, data_dir='../Data/2026', smooth_window=SMOOTH_WINDOW, top_k=TOP_K):
         self.data_dir = data_dir
+        self.top_k = top_k
         self.smooth_window = smooth_window
         self.img_dir = os.path.join(data_dir, 'Images')
 
@@ -370,9 +371,52 @@ class Test_Error:
         print(f'\noverall ranking (mean RMSE + mean R2 across FMs) -> {out}')
         print(overall.to_string(index=False))
 
-        top = overall.model.head(TOP_K).tolist()
-        print(f'\ntop {TOP_K} models: {top}')
+        self._write_train_test(df, overall)
+
+        top = overall.model.head(self.top_k).tolist()
+        print(f'\ntop {self.top_k} models: {top}')
         return top, overall.set_index('model')
+
+    def _write_train_test(self, df_test, overall):
+        """Train (train_error.py) and test error side by side, per FM and overall.
+
+        Uses the matching train rows (with_exp = No for the no_exp variant) from
+        train_error_summary.csv; skipped with a note if that file is missing.
+        Writes Data/2026/train_test_error_{VARIANT}.csv: one row per (FM, model)
+        plus FM='all' rows with the means across FMs, ordered by overall rank.
+        """
+        path = os.path.join(self.data_dir, 'train_error_summary.csv')
+        if not os.path.exists(path):
+            print(f'{path} not found -- run train_error.py first; train/test csv skipped')
+            return
+        exp_id = 'Yes' if VARIANT == 'with_exp' else 'No'
+        tr = pd.read_csv(path)
+        tr = (tr[tr.with_exp == exp_id]
+              .rename(columns={'n_rows': 'train_n', 'RMSE': 'train_RMSE', 'R2': 'train_R2'})
+              [['FM', 'model', 'train_n', 'train_RMSE', 'train_R2']])
+        te = (df_test.rename(columns={'n_points': 'test_n', 'RMSE': 'test_RMSE',
+                                      'R2': 'test_R2', 'RMSE_mean': 'test_RMSE_mean',
+                                      'rank': 'test_rank_in_FM'})
+              [['FM', 'model', 'test_n', 'test_RMSE', 'test_R2', 'test_RMSE_mean',
+                'test_rank_in_FM']])
+        te['FM'] = te.FM.astype(str)
+        tr['FM'] = tr.FM.astype(str)
+        per_fm = te.merge(tr, on=['FM', 'model'], how='left')
+
+        means = (per_fm.groupby('model')[['train_RMSE', 'train_R2', 'test_RMSE', 'test_R2',
+                                          'test_RMSE_mean']].mean().reset_index()
+                 .assign(FM='all'))
+        rank = overall.set_index('model').overall_rank
+        out_df = pd.concat([per_fm, means], ignore_index=True)
+        out_df.insert(0, 'overall_rank', out_df.model.map(rank).astype(int))
+        out_df['_all'] = out_df.FM == 'all'
+        out_df = (out_df.sort_values(['_all', 'FM', 'overall_rank'], key=lambda s: s.map(
+                      lambda v: int(v) if isinstance(v, str) and v.isdigit() else v))
+                  .drop(columns='_all').reset_index(drop=True))
+        out = os.path.join(self.data_dir, f'train_test_error_{VARIANT}.csv')
+        out_df.to_csv(out, index=False)
+        print(f'\ntrain + test error -> {out}')
+        print(out_df.to_string(index=False, float_format=lambda x: f'{x:.5g}'))
 
     def run(self):
         found = self._discover()
@@ -433,6 +477,9 @@ if __name__ == "__main__":
                         help="Directory holding Real_data_projected_{fm}_{variant}_v2.csv")
     parser.add_argument("--smooth_window", type=int, default=SMOOTH_WINDOW,
                         help="Savitzky-Golay window in omega-grid points (odd; larger = smoother)")
+    parser.add_argument("--top_k", type=int, default=TOP_K,
+                        help="Number of best-ranked models plotted in projected_I_*.png "
+                             f"(default {TOP_K}; {len(MODEL_NAMES)} = all)")
     args = parser.parse_args()
 
-    Test_Error(data_dir=args.data_dir, smooth_window=args.smooth_window).run()
+    Test_Error(data_dir=args.data_dir, smooth_window=args.smooth_window, top_k=args.top_k).run()
