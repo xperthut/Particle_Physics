@@ -73,7 +73,8 @@ if __name__ == "__main__":
     parser.add_argument("--n_iter", type=int, required=False, default=20,
                          help="Number of BayesSearchCV iterations per P.")
     parser.add_argument("--cv_splits", type=int, required=False, default=5,
-                         help="TimeSeriesSplit folds used during the hyperparameter search (fewer = faster).")
+                         help="Forward-in-omega CV folds (OmegaBlockSplit on w5) used during the "
+                              "hyperparameter search (fewer = faster).")
     parser.add_argument("--search_sample_size", type=int, required=False, default=20000,
                          help="Row cap used while searching hyperparameters per P; the winning config is "
                               "still refit on the full per-P data afterwards.")

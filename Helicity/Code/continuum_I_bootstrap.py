@@ -29,7 +29,9 @@ Writes: Data/2026/I_omega_continuum_boot_{model}{suffix}.csv
             omega, I, sigma_stat, sigma_sys, sigma_tot, I_lin_a, c2, I_FM<fm>
         Data/2026/Images/I_omega_continuum_boot_{model}{suffix}.{png,pdf}
 
-Run from Helicity/Code:  python continuum_I_bootstrap.py [--model GP] [--source roll]
+The model is the overall #1 (FM == 'all') in Data/2026/train_test_error_no_exp.csv.
+
+Run from Helicity/Code:  python continuum_I_bootstrap.py [--source roll]
 """
 
 import argparse
@@ -42,7 +44,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.ticker import MultipleLocator
 
-from test_error import MIN_P, SMOOTH_WINDOW, get_smooth_curve
+from test_error import MIN_P, SMOOTH_WINDOW, best_model, get_smooth_curve
 
 FM_TO_A = {9: 0.0888, 12: 0.1207, 15: 0.151}     # fm, from the rpitd file headers
 W_DECIMALS = 1
@@ -156,18 +158,9 @@ def plot(out, fms, a, model, source, out_base):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", default='../Data/2026')
-    parser.add_argument("--model", default=None,
-                        help="M_<model> column to use (default: the #1 model in "
-                             "test_error_ranking_no_exp.csv, else GP)")
     parser.add_argument("--source", choices=['roll', 'anchored'], default='roll',
                         help="roll: plain projection; anchored: reconstruct_real_data.py --anchor_real")
     parser.add_argument("--smooth_window", type=int, default=SMOOTH_WINDOW,
                         help="Savitzky-Golay window for I(omega), as in test_error.py")
     args = parser.parse_args()
-    if args.model is None:
-        rank_csv = os.path.join(args.data_dir, 'test_error_ranking_no_exp.csv')
-        args.model = (pd.read_csv(rank_csv).sort_values('overall_rank').model.iloc[0]
-                      if os.path.exists(rank_csv) else 'GP')
-        print(f'model: {args.model} (best by test error)' if os.path.exists(rank_csv)
-              else 'model: GP (no test_error ranking found)')
-    run(args.data_dir, args.model, args.source, args.smooth_window)
+    run(args.data_dir, best_model(args.data_dir), args.source, args.smooth_window)

@@ -1,3 +1,30 @@
+# Helicity 2026 pipeline -- every command, in execution order.
+# Run from Helicity/Code. Each step reads the CSVs written by the steps before it.
+# Use the qsar env (the saved models were pickled with sklearn 1.8), e.g.
+#   ~/miniconda3/envs/qsar/bin/python train.py ...
+
+
+# 1. Model selection for M(omega, P) on the real data (All_p_w_m.csv)
+#    -> model_selection_fits.csv / _summary.csv / _rmse_per_P.csv / _bootstrap.csv
+#    then the chosen model's curves on omega = 0..20 -> M_curves_M3.csv
+#    (--n_boot 0 skips the Exp bootstrap for a quick run)
+python model_selection.py --n_boot 200
+python model_selection.py --curves M3
+
+
+# 2. Synthetic data: M at P=3 from M_curves_M3.csv, M1..M5 and I from estimate_M_values,
+#    then Exp replicas around them. Builds All_p_w_m.csv from rpitd/*.txt only if missing.
+#    -> new_M.csv, I_omega_estimated.csv, loss_val_FM_{fm}.csv, M_real_vs_est_FM_{fm}.csv,
+#       new_M_S.csv, generated_Synthetic_exp_data.csv
+python synthetic_data_generator.py
+
+
+# 3. Sliding-window train frames, per FM
+#    -> generated_Synthetic_exp_data_{fm}.csv, Synthetic_train_data_{with,without}_exp_{fm}.csv
+python prepare_train_test_data.py
+
+
+# 4. Train every model type, both variants
 python train.py --fm all --with_exp_id 'No' --model_type 'GB'
 python train.py --fm all --with_exp_id 'No' --model_type 'XGB'
 python train.py --fm all --with_exp_id 'No' --model_type 'RF'
@@ -11,39 +38,57 @@ python train.py --fm all --with_exp_id 'Yes' --model_type 'NN'
 python train.py --fm all --with_exp_id 'Yes' --model_type 'GP'
 
 # Single ensemble, e.g. FM 9 only:
-python train.py --fm 9 --with_exp_id 'Yes' --model_type 'XGB'
-
-# Reads Data/2026/Synthetic_train_data_{with,without}_exp_{fm}.csv (written by
-# prepare_train_test_data.py) and writes, per FM:
-#   model/2026/{fm}/{model_type}_exp_{with_exp_id}.sav           (list of per-P fitted estimators)
-#   model/2026/{fm}/{model_type}_exp_{with_exp_id}_best_params.json  (per-P best hyperparameters found by BayesSearchCV)
+#   python train.py --fm 9 --with_exp_id 'Yes' --model_type 'XGB'
+#
+# Writes, per FM:
+#   model/2026/{fm}/{model_type}_exp_{with_exp_id}.sav               (list of per-P fitted estimators)
+#   model/2026/{fm}/{model_type}_exp_{with_exp_id}_best_params.json  (per-P best hyperparameters from BayesSearchCV)
 #
 # Speed knobs (defaults: n_iter=20, cv_splits=5, search_sample_size=20000):
-# the search phase runs on at most --search_sample_size rows per P with
-# --cv_splits TimeSeriesSplit folds; the winning hyperparameters are then
-# refit on the FULL per-P data, so these only trade search precision for
-# speed, not final-model accuracy. Progress prints per BayesSearchCV
-# iteration since a full run is otherwise silent for a long time. GB is the
-# slowest model type (sequential boosting, no internal parallelism) --
-# lower --n_iter/--search_sample_size for it first if it's too slow, e.g.:
+# the search runs on at most --search_sample_size rows per P with --cv_splits
+# forward-in-omega folds (train on w5 <= cut, validate on the next omega block,
+# see OmegaBlockSplit in model.py); the winning hyperparameters are then refit on the FULL
+# per-P data, so these only trade search precision for speed. GB is the slowest
+# (sequential boosting) -- lower --n_iter/--search_sample_size for it first, e.g.:
 #   python train.py --fm 9 --with_exp_id 'Yes' --model_type 'GB' --n_iter 10 --search_sample_size 10000
 #
-# NN (MLP, inputs and target standardised) uses the same BayesSearchCV knobs,
-# searching width/depth/alpha/learning rate.
+# NN (MLP, standardised inputs/target) uses the same BayesSearchCV knobs.
 # GP ignores --n_iter/--cv_splits/--search_sample_size: its kernel is tuned by
-# maximum likelihood and it is fit on --gp_max_samples rows per P (default
-# 2000), since exact GP cost grows as n^3. Raise it for accuracy, lower it for speed:
+# maximum likelihood on --gp_max_samples rows per P (default 2000; cost ~ n^3):
 #   python train.py --fm 9 --with_exp_id 'No' --model_type 'GP' --gp_max_samples 3000
 #
-# reconstruct_real_data.py / train_error.py / test_error.py use whichever of
-# GB, RF, XGB, NN, GP have a saved .sav and skip the rest.
+# Steps 5-7 use whichever of GB, RF, XGB, NN, GP have a saved .sav and skip the rest.
 
 
-# Execution order
-1. synthetic_data_generation.py
-2. prepare_train_test_data.py
-3. train.py --with_exp_id Yes
-4. train.py --with_exp_id No
-5. reconstruct_real_data.py --exp_id 'Yes'
-6. train_error.py
-7. test_error.py
+# 5. Training error (RMSE / R2 per FM, model, variant) -> printed
+python train_error.py
+
+
+# 6. Roll the models forward in omega from the synthetic seed
+#    -> Real_data_projected_{fm}_no_exp_v2.csv / _with_exp_v2.csv
+python reconstruct_real_data.py
+python reconstruct_real_data.py --exp_id Yes
+#    real-anchored replicas + GP latent draws, needed by continuum_M_extrapolation.py (step 9)
+#    -> Real_data_projected_{fm}_no_exp_anchored_v2.csv, ..._anchored_draws_v2.csv
+python reconstruct_real_data.py --anchor_real --n_draws 200 --models GP
+
+
+# 7. M -> I(omega) per FM, test error vs real data, model ranking
+#    -> Projected_M_mean_std_no_exp_{fm}.csv, Projected_I_no_exp_{fm}.csv,
+#       test_error_summary_no_exp.csv, test_error_ranking_no_exp.csv,
+#       best_model_I_no_exp_{model}.csv
+python test_error.py
+
+
+# 8. One model's I(omega) for all FM on one plot -> I_omega_all_FM_{model}_no_exp.csv
+python combine_I_omega.py --model GP
+
+
+# 9. Continuum limit a -> 0
+#    pointwise on the best model's I (reads best_model_I_no_exp_GP.csv) -> I_omega_continuum.csv
+python continuum_extrapolation.py
+#    per Exp bootstrap sample on I -> I_omega_continuum_boot_GP.csv
+python continuum_I_bootstrap.py --model GP --source roll
+#    on M first, then I, with confidence band (needs the --anchor_real run of step 6)
+#    -> I_omega_continuum_M_GP_anchored.csv, M_continuum_fit_GP_anchored.csv
+python continuum_M_extrapolation.py --model GP --source anchored --n_boot 500

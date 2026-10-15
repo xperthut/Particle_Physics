@@ -64,7 +64,10 @@ Writes
     Data/2026/M_continuum_fit_{model}.csv     per-(P, form) RMS residual, AIC, theta
     Data/2026/Images/I_omega_continuum_M_{model}.{png,pdf}
 
-Run from Helicity/Code:  python continuum_M_extrapolation.py [--model GP] [--n_boot 500]
+The model is the overall #1 (FM == 'all') in Data/2026/train_test_error_no_exp.csv;
+latent draws exist only for GP, otherwise the band is configurations + fit only.
+
+Run from Helicity/Code:  python continuum_M_extrapolation.py [--n_boot 500]
 """
 
 import argparse
@@ -77,7 +80,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.ticker import MultipleLocator
 
-from test_error import MIN_P, SMOOTH_WINDOW, get_smooth_curve
+from test_error import MIN_P, SMOOTH_WINDOW, best_model, get_smooth_curve
 
 FM_TO_A = {9: 0.0888, 12: 0.1207, 15: 0.151}     # fm, from the rpitd file headers
 W_DECIMALS = 1
@@ -321,7 +324,6 @@ def plot(out, fms, a, w_form, weighting, w_real, model, band, out_base):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", default='../Data/2026')
-    parser.add_argument("--model", default='GP', help="M_<model> column to use (GP ranks best)")
     parser.add_argument("--n_boot", type=int, default=500, help="bootstrap samples over Exp")
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--weights", choices=['equal', 'aic'], default='equal',
@@ -332,5 +334,5 @@ if __name__ == "__main__":
                         help="anchored: reconstruct_real_data.py --anchor_real output (+ GP draws "
                              "if present); roll: the plain seed-only roll")
     args = parser.parse_args()
-    run(args.data_dir, args.model, args.n_boot, args.seed, args.smooth_window, args.weights,
+    run(args.data_dir, best_model(args.data_dir), args.n_boot, args.seed, args.smooth_window, args.weights,
         args.source)

@@ -84,6 +84,17 @@ VARIANT = 'no_exp'
 _FILE_RE = re.compile(r'Real_data_projected_(.+)_(no_exp|with_exp)_v2\.csv$')
 
 
+def best_model(data_dir, variant=VARIANT):
+    """Overall #1 model (FM == 'all') in train_test_error_{variant}.csv, written by this script."""
+    path = os.path.join(data_dir, f'train_test_error_{variant}.csv')
+    if not os.path.exists(path):
+        raise FileNotFoundError(f'{path} not found -- run test_error.py first')
+    d = pd.read_csv(path, dtype={'FM': str})
+    best = d[d.FM == 'all'].sort_values('overall_rank').model.iloc[0]
+    print(f'model: {best} (rank 1 overall in {path})')
+    return best
+
+
 def get_smooth_curve(val, window=SMOOTH_WINDOW, polyorder=SMOOTH_POLYORDER):
     """Savitzky-Golay smooth of a 1-D series on a uniform grid.
 

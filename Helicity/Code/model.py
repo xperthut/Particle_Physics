@@ -4,7 +4,6 @@ from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
 from sklearn.neural_network import MLPRegressor
 from sklearn.compose import TransformedTargetRegressor
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.base import clone, BaseEstimator, RegressorMixin
 from sklearn import pipeline
 from xgboost import XGBRegressor
@@ -18,9 +17,9 @@ warnings.filterwarnings("ignore")
 # Bayesian-optimization iteration budget shared by every model's BayesSearchCV
 # unless a caller overrides it per call.
 DEFAULT_N_ITER = 20
-# CV folds used during the search phase. Kept small because TimeSeriesSplit's
-# later folds train on almost the full search sample each time, so cost scales
-# ~linearly with this.
+# CV folds used during the search phase (OmegaBlockSplit, forward-chaining in
+# omega). Kept small because later folds train on most of the search sample
+# each time, so cost scales ~linearly with this.
 DEFAULT_CV_SPLITS = 5
 # Hard cap on rows used *while searching* hyperparameters, since
 # BayesSearchCV re-fits the estimator n_iter * cv_splits times and this
@@ -96,6 +95,35 @@ class ScaledMLPRegressor(BaseEstimator, RegressorMixin):
         return self.model_.predict(X)
 
 
+class OmegaBlockSplit:
+    """Forward-chaining CV over omega instead of row order.
+
+    The train frames are ordered P -> Exp -> W, so TimeSeriesSplit folds end
+    up splitting by Exp replica: validation rows are other noisy draws of the
+    same curve on the same omega grid, which scores interpolation. The models
+    are used to extrapolate forward in omega (reconstruct_real_data.py), so
+    each fold here trains on windows whose target omega (``w_col``) is at or
+    below a cut and validates on the next omega block above it. Cuts sit at
+    quantiles of the distinct omega values, giving n_splits + 1 blocks.
+    """
+
+    def __init__(self, n_splits=DEFAULT_CV_SPLITS, w_col='w5'):
+        self.n_splits = n_splits
+        self.w_col = w_col
+
+    def get_n_splits(self, X=None, y=None, groups=None):
+        return self.n_splits
+
+    def split(self, X, y=None, groups=None):
+        w = np.asarray(X[self.w_col], dtype=float)
+        edges = np.quantile(np.unique(w), np.linspace(0, 1, self.n_splits + 2))
+        for k in range(1, self.n_splits + 1):
+            train = np.where(w <= edges[k])[0]
+            test = np.where((w > edges[k]) & (w <= edges[k + 1]))[0]
+            if len(train) and len(test):
+                yield train, test
+
+
 def _to_native(value):
     """Cast numpy scalar types coming out of BayesSearchCV's best_params_ to
     plain python types so the params dict is JSON-serialisable."""
@@ -117,9 +145,8 @@ class Model:
         n = len(X)
 
         if n > search_sample_size:
-            # Sorted random subsample: cheap to search on, and sorting keeps
-            # row order intact so TimeSeriesSplit's fold-by-order semantics
-            # still mean roughly the same thing as on the full data.
+            # Random subsample: cheap to search on. OmegaBlockSplit folds by
+            # w5, not row order, so the subsample keeps the same fold layout.
             rng = np.random.RandomState(p)
             idx = np.sort(rng.choice(n, size=search_sample_size, replace=False))
             X_search, Y_search = X.iloc[idx], Y[idx]
@@ -127,13 +154,13 @@ class Model:
             X_search, Y_search = X, Y
 
         start = time.time()
-        splits = min(cv_splits, len(X_search) - 1)
+        splits = min(cv_splits, X_search['w5'].nunique() - 1)
 
         search = BayesSearchCV(
             estimator=estimator,
             search_spaces=search_spaces,
             n_iter=n_iter,
-            cv=TimeSeriesSplit(n_splits=splits),
+            cv=list(OmegaBlockSplit(n_splits=splits).split(X_search)),
             scoring="neg_mean_squared_error",
             verbose=0,
             refit=False,  # we refit the winning config on the full data ourselves, below

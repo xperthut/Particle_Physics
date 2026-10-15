@@ -22,6 +22,8 @@ env/
 
 # Logs
 *.log
+Code/*.ipynb
+Code/*.txt
 
 # Data: only .txt files are tracked (raw/source data). Generated .csv
 # frames, plots, zips, intermediate binaries, etc. under a Data/ folder are
@@ -40,3 +42,6 @@ Model/
 CLAUDE.md
 .claude/
 
+
+# macOS AppleDouble files (exFAT drive)
+._*

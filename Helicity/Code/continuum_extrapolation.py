@@ -2,6 +2,7 @@
 
 Reads the long-format file written by test_error.py
     Data/2026/best_model_I_no_exp_{model}.csv      (columns FM, W, I)
+with {model} the overall #1 (FM == 'all') in Data/2026/train_test_error_no_exp.csv,
 where FM is the lattice spacing in units of 0.01 fm (9, 12, 15 -> a = 0.09,
 0.12, 0.15 fm).  At each fixed omega the per-a values are fit by least squares to
 
@@ -33,6 +34,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.ticker import MultipleLocator
+
+from test_error import best_model
 
 FM_TO_A = 0.01                   # FM column is a in units of 0.01 fm
 W_DECIMALS = 1
@@ -122,9 +125,9 @@ def main(src, data_dir):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--src", default='../Data/2026/best_model_I_no_exp_GP.csv',
-                        help="Long-format FM, W, I file (from test_error.py)")
     parser.add_argument("--data_dir", default='../Data/2026',
-                        help="Where to write I_omega_continuum.csv and Images/")
+                        help="Where to read best_model_I_no_exp_<model>.csv and write "
+                             "I_omega_continuum.csv and Images/")
     args = parser.parse_args()
-    main(args.src, args.data_dir)
+    src = os.path.join(args.data_dir, f'best_model_I_no_exp_{best_model(args.data_dir)}.csv')
+    main(src, args.data_dir)
