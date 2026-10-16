@@ -9,7 +9,8 @@ each with columns  FM, P, Exp, W, anchored, M_<model> for every model that was
 rolled (GB, RF, XGB, NN, GP -- whichever were trained).  This script
 processes only the no_exp files (VARIANT) and, per FM:
 
-  * averages each model's M over the Exp replicas -> Mean_M_* / Std_M_* per (P, W);
+  * averages each model's M over the Exp replicas -> Mean_M_* / Err_M_* per (P, W),
+    Err = jackknife error over the Exp rows, sqrt(N-1) std (jackknife.py);
   * combines every momentum pair (2 <= p1 < p2; P=1 is left out of the pairs only --
     it is still averaged, written and plotted as an M curve) into an Ioffe-time estimate
         I(w) = (p2^2 * M(p2, w) - p1^2 * M(p1, w)) / (p2^2 - p1^2)
@@ -25,7 +26,7 @@ processes only the no_exp files (VARIANT) and, per FM:
     step artefacts the autoregressive roll leaves in the extrapolated tail.
 
   * writes, per (variant, FM):
-        Data/2026/Projected_M_mean_std_{variant}_{fm}.csv
+        Data/2026/Projected_M_mean_err_{variant}_{fm}.csv
         Data/2026/Projected_I_{variant}_{fm}.csv
         Data/2026/Images/projected_I_{variant}_{fm}.png
 
@@ -58,6 +59,8 @@ import numpy as np
 import pandas as pd
 from scipy.signal import savgol_filter
 from sklearn.metrics import mean_squared_error, r2_score
+
+from jackknife import jk_error, jk_series_error
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -111,12 +114,12 @@ def get_smooth_curve(val, window=SMOOTH_WINDOW, polyorder=SMOOTH_POLYORDER):
     return savgol_filter(val, window_length=w, polyorder=polyorder, mode='interp')
 
 
-def get_mean_std(data, grp_cols, agg_col):
-    """Mean_{agg_col} / Std_{agg_col} of ``agg_col`` grouped by ``grp_cols``."""
+def get_mean_err(data, grp_cols, agg_col):
+    """Mean_{agg_col} / Err_{agg_col} (jackknife error over the Exp rows) grouped by ``grp_cols``."""
     g = data.groupby(grp_cols)[agg_col]
     df_mu = g.mean().reset_index().rename(columns={agg_col: f'Mean_{agg_col}'})
-    df_sigma = g.std(ddof=0).reset_index().rename(columns={agg_col: f'Std_{agg_col}'})
-    return df_mu.merge(df_sigma, on=grp_cols)
+    df_err = g.agg(jk_series_error).reset_index().rename(columns={agg_col: f'Err_{agg_col}'})
+    return df_mu.merge(df_err, on=grp_cols)
 
 
 class Test_Error:
@@ -135,11 +138,11 @@ class Test_Error:
                 out.append((name, m.group(1), m.group(2)))
         return out
 
-    def _mean_std_curves(self, data, names):
-        """One frame indexed by (P, W) with Mean_M_* / Std_M_* per model."""
+    def _mean_err_curves(self, data, names):
+        """One frame indexed by (P, W) with Mean_M_* / Err_M_* (jackknife) per model."""
         df = None
         for name in names:
-            part = get_mean_std(data, ['P', 'W'], f'M_{name}')
+            part = get_mean_err(data, ['P', 'W'], f'M_{name}')
             df = part if df is None else df.merge(part, on=['P', 'W'])
         return df
 
@@ -151,8 +154,23 @@ class Test_Error:
         vals = ((p2 ** 2 * piv[p2] - p1 ** 2 * piv[p1]) / denom).to_numpy()
         return col, vals
 
-    def _compute_I(self, df_ms, names):
-        """I(w) averaged over every (MIN_P <= i < j) momentum pair, + smoothed I(w).
+    def _I_rows(self, data, name, P, W):
+        """Raw and smoothed I(w) on every Exp row (each a jackknife sample), with the
+        same pair rule as _compute_I; each (n_Exp, n_W).  Not clipped at 0, so the
+        jackknife spread is unbiased."""
+        cube = data.set_index(['P', 'Exp', 'W'])[f'M_{name}'].unstack('W').reindex(columns=W)
+        exps = np.sort(data.Exp.unique())
+        M = {p: cube.loc[p].reindex(exps).to_numpy() for p in P}
+        E = np.stack([(j ** 2 * M[j] - i ** 2 * M[i]) / (j ** 2 - i ** 2)
+                      for i in P for j in P if i < j])
+        raw = np.nan_to_num(np.nanmean(np.where(E >= 0, E, np.nan), axis=0), nan=0.0)
+        sm = np.apply_along_axis(get_smooth_curve, 1, raw, self.smooth_window)
+        sm[:, W == 0.0] = 0.0
+        return raw, sm
+
+    def _compute_I(self, df_ms, names, data):
+        """I(w) averaged over every (MIN_P <= i < j) momentum pair, + smoothed I(w),
+        each with its jackknife error over the Exp rows (Err_I_*, Err_smooth_I*).
 
         At each W only the non-negative pair estimates enter the mean; if every
         pair is negative there, I(w) is set to 0 (I is physically non-negative).
@@ -189,36 +207,43 @@ class Test_Error:
             # -- the raw I_* columns keep the unclipped values for diagnostics.
             sm = np.clip(sm, 0.0, None)
             df_I[f'smooth_I{name}'] = sm
-        return df_I[['W'] + [f'I_{n}' for n in names]
-                    + [f'smooth_I{n}' for n in names]]
+            raw_rows, sm_rows = self._I_rows(data, name, present, df_I['W'].to_numpy())
+            df_I[f'Err_I_{name}'] = jk_error(raw_rows, axis=0)
+            df_I[f'Err_smooth_I{name}'] = jk_error(sm_rows, axis=0)
+        return df_I[['W'] + [f'I_{n}' for n in names] + [f'smooth_I{n}' for n in names]
+                    + [f'Err_I_{n}' for n in names] + [f'Err_smooth_I{n}' for n in names]]
 
     def _plot(self, fm, variant, df_ms, df_I, w_anchor, names, df_real=None, overall=None):
         """M(w) (top row) and I(w) (bottom row), one column per model in ``names``.
 
-        Real lattice M (Exp mean +- std) is overlaid on the M panels as open
-        markers, and each column title carries the model's overall test rank.
+        Projected M and smoothed I carry a +-1 sigma jackknife band; real lattice M
+        is drawn as open markers with jackknife error bars.
+        Each column title carries the model's overall test rank.
         """
         ordered_ps = sorted(df_ms.P.unique())
         colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
         real_ms = None
         if df_real is not None and not df_real.empty:
-            real_ms = get_mean_std(df_real, ['P', 'W'], 'M')
+            real_ms = get_mean_err(df_real, ['P', 'W'], 'M')
         n_rows = 2 if df_I is not None else 1
         fig, axes = plt.subplots(n_rows, len(names), figsize=(8 * len(names), 9 * n_rows),
                                  dpi=330, squeeze=False)
 
         for col, name in enumerate(names):
             ax = axes[0, col]
-            f_mu, f_sd = f'Mean_M_{name}', f'Std_M_{name}'
+            f_mu, f_sd = f'Mean_M_{name}', f'Err_M_{name}'
             for k, p in enumerate(ordered_ps):
-                t = df_ms[df_ms.P == p]
+                t = df_ms[df_ms.P == p].sort_values('W')
                 c = colors[k % len(colors)]
-                ax.errorbar(t.W, t[f_mu], yerr=t[f_sd], ecolor=c, color=c,
-                            label=f'$p_z$={p}' if col == 0 else None)
+                ax.plot(t.W, t[f_mu], '-', lw=1.5, color=c,
+                        label=f'$p_z$={p}' if col == 0 else None)
+                ax.fill_between(t.W, t[f_mu] - t[f_sd], t[f_mu] + t[f_sd],
+                                color=c, alpha=0.25, lw=0)
                 if real_ms is not None:
-                    r = real_ms[real_ms.P == p]
-                    ax.errorbar(r.W, r.Mean_M, yerr=r.Std_M, fmt='o', mfc='none', ms=7,
-                                color=c, label='real data' if col == 0 and k == 0 else None)
+                    r = real_ms[real_ms.P == p].sort_values('W')
+                    ax.errorbar(r.W, r.Mean_M, yerr=r.Err_M, fmt='o', mfc='none', ms=6,
+                                capsize=3, color=c,
+                                label=r'real data $\pm\sigma_{JK}$' if col == 0 and k == 0 else None)
             title = MODEL_TITLES[name]
             if overall is not None and name in overall.index:
                 o = overall.loc[name]
@@ -234,8 +259,10 @@ class Test_Error:
                 axI = axes[1, col]
                 axI.plot(df_I['W'], df_I[f'I_{name}'], '.', ms=4, alpha=0.35,
                          color=colors[0], label='raw')
-                axI.plot(df_I['W'], df_I[f'smooth_I{name}'], '-', lw=2,
-                         color=colors[3], label='smoothed')
+                sm, e = df_I[f'smooth_I{name}'], df_I[f'Err_smooth_I{name}']
+                axI.fill_between(df_I['W'], np.clip(sm - e, 0.0, None), sm + e,
+                                 color=colors[3], alpha=0.3, lw=0, label=r'$\pm\sigma_{JK}$')
+                axI.plot(df_I['W'], sm, '-', lw=2, color=colors[3], label='smoothed')
                 if w_anchor and w_anchor > 0:
                     axI.axvline(w_anchor, ls='--', lw=1, color='0.5')
                 axI.set_xlabel(r'$\omega$')
@@ -267,7 +294,9 @@ class Test_Error:
             if df_I is None or f'smooth_I{best}' not in df_I:
                 continue
             w, y = df_I['W'].to_numpy(), df_I[f'smooth_I{best}'].to_numpy()
+            e = df_I[f'Err_smooth_I{best}'].to_numpy()
             c = colors[k % len(colors)]
+            ax.fill_between(w, np.clip(y - e, 0.0, None), y + e, color=c, alpha=0.2, lw=0)
             ax.plot(w, y, styles[k % len(styles)], lw=2, color=c, label=f'FM={fm}')
             i = int(np.argmax(y))                       # direct label at the peak
             ax.annotate(f'FM={fm}', (w[i], y[i]), xytext=(0, 6), textcoords='offset points',
@@ -445,17 +474,17 @@ class Test_Error:
             print(f'[{variant}] FM={fm}: {len(data)} rows, P={sorted(data.P.unique())}, '
                   f'{data.Exp.nunique()} Exp replicas, models={names}')
 
-            df_ms = self._mean_std_curves(data, names)
-            df_I = self._compute_I(df_ms, names)
+            df_ms = self._mean_err_curves(data, names)
+            df_I = self._compute_I(df_ms, names, data)
 
             w_anchor = 0.0
             if 'anchored' in data.columns:
                 anch = data[data.anchored == 1]
                 w_anchor = float(anch.W.max()) if not anch.empty else 0.0
 
-            ms_out = os.path.join(self.data_dir, f'Projected_M_mean_std_{variant}_{fm}.csv')
+            ms_out = os.path.join(self.data_dir, f'Projected_M_mean_err_{variant}_{fm}.csv')
             df_ms.to_csv(ms_out, index=False)
-            print(f'  mean/std -> {ms_out}')
+            print(f'  mean/jackknife err -> {ms_out}')
 
             if df_I is not None:
                 I_out = os.path.join(self.data_dir, f'Projected_I_{variant}_{fm}.csv')

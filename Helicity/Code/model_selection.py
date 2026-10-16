@@ -2,7 +2,8 @@
 
 Every model is fit, per lattice ensemble FM, to the same cells: the real
 per-(P, omega) mean M over the Exp replicas, P = 1..5, omega > 0 (the W=0
-anchor rows are excluded), with weight n / std^2 (1 / SE^2 of the cell mean)
+anchor rows are excluded), with weight 1 / err^2, err = the jackknife error of the
+cell mean over Exp (jackknife.py: the Exp rows are jackknife samples, err = sqrt(n-1) std)
 -- the likelihood used by synthetic_data_generator.generate_I_omega.
 
     M1  A w e^{-s w} P^{-g} e^{c z2}          (the model in generate_I_omega)
@@ -21,19 +22,21 @@ With Gaussian errors of known sigma, -2 ln L = chi^2 + const, so
     BIC  = chi^2 + k ln N
 Each fit is multi-started within wide bounds and the lowest chi^2 is kept.
 
-The selection criterion is QAICc.  No candidate fits within the tiny cell SEs
-(chi^2/dof ~ 1e5-1e6 for every model), so raw Delta-AIC mostly measures the
-size of the SEs.  QAIC divides chi^2 by the overdispersion c_hat = chi^2/dof
-of the most flexible model (M6) in that FM, counting c_hat as one extra
-parameter (k' = k + 1):
+The selection criterion is QAICc.  With jackknife cell errors chi^2/dof is O(1),
+but neighbouring omega cells are correlated (same configurations) and that
+correlation is not in the diagonal chi^2.  QAIC guards against the resulting
+overdispersion by dividing chi^2 by c_hat = chi^2/dof of the most flexible model
+(M6) in that FM, counting c_hat as one extra parameter (k' = k + 1):
     QAIC  = chi^2 / c_hat + 2k'
     QAICc = QAIC + 2k'(k'+1) / (N - k' - 1)
 AIC/AICc/BIC and the unweighted per-P RMSE (mean over P = model error per FM)
 are still written for reference.
 
---n_boot B resamples the Exp configurations with replacement (jointly across
-P within an FM; c_hat kept from the full sample), refits every model on each
-resample and counts how often each model is best by QAICc.
+--n_boot B resamples the Exp rows with replacement (jointly across P within an
+FM; c_hat kept from the full sample), refits every model on each resample and
+counts how often each model is best by QAICc.  The rows are jackknife samples,
+so the resampled mean's deviation is scaled by (n - 1) (= resampling the
+jackknife pseudo-values) to give the cell means their true spread.
 
 Writes (Data/2026/):
     model_selection_fits.csv      per (FM, model): k, N, chi2, chi2_dof, c_hat, QAIC(c),
@@ -43,7 +46,11 @@ Writes (Data/2026/):
     model_selection_bootstrap.csv per (FM, model): share of resamples won by QAICc
     Images/model_selection_FM_{fm}.png   data vs the best models by QAICc, one panel per P
 
+best_model() reads these back and returns the selected form (highest bootstrap
+QAICc win fraction, ties by summed QAICc); `--curves` with no names plots it.
+
 Run from Helicity/Code:  python model_selection.py [--n_boot 200]
+                         python model_selection.py --curves    -> M_curves_<best>.csv
 """
 
 import argparse
@@ -56,6 +63,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.optimize import least_squares
+
+from jackknife import jk_error
 
 warnings.filterwarnings("ignore")
 
@@ -112,15 +121,15 @@ MODELS = {
 
 
 def load_cells(data, fm):
-    """Real cells of one FM: P, W, mean, std, n, weight (= n / std^2), and the
+    """Real cells of one FM: P, W, mean, err (jackknife), n, weight (= 1 / err^2), and the
     Exp x cell matrix of M used to rebuild cell means under bootstrap."""
     d = data[(data.FM == fm) & (data.W > 0) & data.P.isin(P_SET)]
     piv = d.pivot_table(index='Exp', columns=['P', 'W'], values='M')
     cells = piv.columns.to_frame(index=False)
     cells['mean'] = piv.mean().to_numpy()
-    cells['std'] = piv.std().to_numpy()
+    cells['err'] = jk_error(piv.to_numpy(), axis=0)
     cells['n'] = piv.count().to_numpy()
-    cells['weight'] = cells['n'] / cells['std'] ** 2
+    cells['weight'] = 1.0 / cells['err'] ** 2
     return cells, piv.to_numpy()
 
 
@@ -180,7 +189,7 @@ def plot_fm(fm, cells, fits, z2_max, top):
     colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
     for ax, p in zip(axes.flat, ps):
         c = cells[cells.P == p]
-        ax.errorbar(c.W, c['mean'], yerr=c['std'], fmt='o', color='k', ms=5, capsize=3, label='real')
+        ax.errorbar(c.W, c['mean'], yerr=c['err'], fmt='o', color='k', ms=5, capsize=3, label='real')
         wg = np.linspace(1e-3, c.W.max() * 1.1, 200)
         for k, name in enumerate(top):
             theta = fits[name]
@@ -199,7 +208,7 @@ def plot_fm(fm, cells, fits, z2_max, top):
 def plot_compare(names):
     """Real cell means vs the saved fits of ``names`` (model_selection_fits.csv),
     every FM x P; under each M row, the residual (model - real) in units of the
-    cell's std.  Writes Images/model_selection_compare_{names}.png."""
+    cell's jackknife error.  Writes Images/model_selection_compare_{names}.png."""
     data = load_real_data()
     fits = pd.read_csv(os.path.join(DATA_DIR, 'model_selection_fits.csv'))
     fms = sorted(data.FM.unique())
@@ -215,7 +224,7 @@ def plot_compare(names):
             ax, axr = axes[2 * r, col], axes[2 * r + 1, col]
             c = cells[cells.P == p]
             wg = np.linspace(1e-3, c.W.max() * 1.1, 200)
-            ax.errorbar(c.W, c['mean'], yerr=c['std'], fmt='o', color='k', ms=5, capsize=3,
+            ax.errorbar(c.W, c['mean'], yerr=c['err'], fmt='o', color='k', ms=5, capsize=3,
                         label='real', zorder=3)
             for k, name in enumerate(names):
                 row = fits[(fits.FM == fm) & (fits.model == name)].iloc[0]
@@ -224,13 +233,13 @@ def plot_compare(names):
                 ls = '-' if k == 0 else '--'
                 ax.plot(wg, f(wg, float(p), theta, z2_max), ls, lw=1.8, color=colors[k],
                         label=f'{name} ($\\chi^2$/dof={row.chi2_dof:.2g})')
-                pull = (f(c.W.to_numpy(), float(p), theta, z2_max) - c['mean']) / c['std']
+                pull = (f(c.W.to_numpy(), float(p), theta, z2_max) - c['mean']) / c['err']
                 axr.plot(c.W, pull, 'o' + ls, color=colors[k], ms=4, lw=1)
             axr.axhline(0, color='0.5', lw=0.8)
             ax.set_title(f'FM={fm}  $p_z$={p}')
             if col == 0:
                 ax.set_ylabel(r'$\Delta\mathfrak{M}(\omega)$')
-                axr.set_ylabel('(model-real)/std')
+                axr.set_ylabel('(model-real)/err')
                 ax.legend(fontsize=8)
             axr.set_xlabel(r'$\omega$')
     fig.suptitle(' vs '.join(f'{n}: {MODELS[n][0]}' for n in names), fontsize=13)
@@ -265,7 +274,7 @@ def plot_curves(name, w_grid=np.round(np.arange(0.0, 20.05, 0.1), 1)):
             col = colors[k % len(colors)]
             ax.plot(w_grid, m, '-', lw=1.8, color=col, label=fr'$p_z$={p}')
             c = cells[cells.P == p]
-            ax.errorbar(c.W, c['mean'], yerr=c['std'], fmt='o', color=col, mfc='none',
+            ax.errorbar(c.W, c['mean'], yerr=c['err'], fmt='o', color=col, mfc='none',
                         ms=6, capsize=2)
         ax.axhline(0, color='0.6', lw=0.6)
         ax.set_title(f'FM={fm}   ' + ', '.join(f'{pn}={v:.3g}' for pn, v in
@@ -280,6 +289,25 @@ def plot_curves(name, w_grid=np.round(np.arange(0.0, 20.05, 0.1), 1)):
     plt.close(fig)
     pd.concat(parts, ignore_index=True).to_csv(os.path.join(DATA_DIR, f'M_curves_{name}.csv'), index=False)
     print(f'plot -> {out}')
+
+
+def best_model():
+    """The selected M(omega, P) form: highest mean bootstrap QAICc win fraction over FMs
+    (model_selection_bootstrap.csv), ties broken by summed QAICc (model_selection_summary.csv);
+    summed QAICc alone if the bootstrap was skipped (--n_boot 0)."""
+    summ = os.path.join(DATA_DIR, 'model_selection_summary.csv')
+    if not os.path.exists(summ):
+        raise FileNotFoundError(f'{summ} not found -- run  python model_selection.py  first')
+    rank = pd.read_csv(summ).set_index('model')[['QAICc']]
+    boot = os.path.join(DATA_DIR, 'model_selection_bootstrap.csv')
+    if os.path.exists(boot):
+        rank['win'] = pd.read_csv(boot).groupby('model').win_frac_QAICc.mean()
+        best = rank.sort_values(['win', 'QAICc'], ascending=[False, True]).index[0]
+        print(f'best model: {best} (bootstrap QAICc win fraction {rank.win[best]:.3f}, {boot})')
+    else:
+        best = rank.QAICc.idxmin()
+        print(f'best model: {best} (lowest summed QAICc, {summ}; no bootstrap file)')
+    return best
 
 
 def main(n_boot, seed):
@@ -341,7 +369,9 @@ def main(n_boot, seed):
             n_exp = Mmat.shape[0]
             for b in range(n_boot):
                 idx = rng.integers(0, n_exp, n_exp)
-                yb = np.nanmean(Mmat[idx], axis=0)        # sigma and c_hat kept from the full sample
+                # rows are jackknife samples: scale the deviation by (n-1) (pseudo-values);
+                # sigma and c_hat kept from the full sample
+                yb = y + (n_exp - 1) * (np.nanmean(Mmat[idx], axis=0) - y)
                 sc = {}
                 for name, (_, pnames, *_rest) in MODELS.items():
                     _, chi2 = fit_model(name, w, P, yb, sw, z2_max, rng, x0=fits[name], n_starts=3)
@@ -446,12 +476,13 @@ if __name__ == '__main__':
     parser.add_argument('--compare', nargs='+', choices=list(MODELS), default=None,
                         help='Only plot these models from the saved model_selection_fits.csv '
                              '(no refit), e.g. --compare M1 M8')
-    parser.add_argument('--curves', nargs='+', choices=list(MODELS), default=None,
-                        help='Only plot M(w, P) on w = 0..20 (step 0.1) for each of these saved fits, '
-                             'one figure per model, e.g. --curves M1 M8')
+    parser.add_argument('--curves', nargs='*', choices=list(MODELS), default=None,
+                        help='Only plot M(w, P) on w = 0..20 (step 0.1) from the saved fits, one '
+                             'figure per model.  Bare --curves = the best model (best_model()); '
+                             'names plot those instead, e.g. --curves M1 M8')
     args = parser.parse_args()
-    if args.curves:
-        for name in args.curves:
+    if args.curves is not None:
+        for name in args.curves or [best_model()]:
             plot_curves(name)
     elif args.compare:
         plot_compare(args.compare)

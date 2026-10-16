@@ -7,19 +7,26 @@ Stages run by ``__main__``:
    keeping only the ``N_OMEGA_PER_FM[fm]`` smallest omega values per (FM, P).
 
 2. ``generate_m_omega`` -- per FM, take M at P=3 from the selected model's
-   curve (``M_curves_{MK_MODEL}.csv``, written by ``model_selection.py --curves``)
+   curve (``M_curves_<best>.csv``, written by ``model_selection.py --curves``;
+   <best> = ``model_selection.best_model()``, picked from the QAICc tables)
    as the best match and estimate every other P with
    ``model_selection.estimate_M_values``, so every momentum pair gives the same
    I(omega) under M_P = I + Y / P^2.  Writes ``new_M.csv`` (omega = 0..20),
    ``I_omega_estimated.csv``, ``loss_val_FM_{fm}.csv`` and
    ``M_real_vs_est_FM_{fm}.csv``.
 
+   Before that, ``real_data_diagnostics`` (CSVs/plots only): mean-vs-median and
+   normal Q-Q plot (``mean_median_and_qq.png``), mean/std(M) vs omega per P with
+   linear fits (``Mean_vs_W_FM_*.png``, ``Std_vs_W_FM_*.png``) and the linear-vs-
+   quadratic check of both (``linearity_check.csv``).  ``--diagnostics_only``
+   stops after these.
+
 3. ``generate_m_omega_from_distribution`` -- draw synthetic Exp replicas of M
    around ``new_M.csv`` with a linear std(omega) model, written to
    ``generated_Synthetic_exp_data.csv`` (read by prepare_train_test_data.py).
 
 Run with ``Helicity/Code`` as the working directory:  ``python synthetic_data_generator.py``
-(run ``python model_selection.py --curves M3`` first if ``M_curves_M3.csv`` is missing).
+(run ``python model_selection.py --curves`` first if ``M_curves_<best>.csv`` is missing).
 """
 
 import argparse
@@ -33,7 +40,8 @@ import matplotlib.pyplot as plt
 from scipy import stats
 from scipy.signal import savgol_filter
 
-from model_selection import estimate_M_values
+from jackknife import jk_series_error
+from model_selection import best_model, estimate_M_values
 
 warnings.filterwarnings("ignore")
 pd.options.mode.chained_assignment = None
@@ -50,8 +58,7 @@ VERSION = 2026
 DATA_DIR = f'../Data/{VERSION}/'
 IMG_DIR = f'../Data/{VERSION}/Images/'
 
-# model_selection fit whose P=3 curve is taken as the best match (Mk)
-MK_MODEL = 'M3'
+# the P=3 curve of the best model_selection fit (model_selection.best_model()) is Mk
 MK_P = 3
 N_P = 5
 
@@ -117,21 +124,192 @@ def create_combined_data():
 
 
 def real_mean_M(data, fm):
-    """Mean/std real M per (P, W) for one ensemble."""
+    """Mean real M per (P, W) for one ensemble, with its jackknife error over Exp (Err_M)
+    and the per-configuration spread (Std_M, the quantity the noise model is fit to)."""
     df_g = (
         data[data.FM == fm]
-        .groupby(['P', 'W'])['M'].agg(Mean_M='mean', Std_M='std')
+        .groupby(['P', 'W'])['M'].agg(Mean_M='mean', Err_M=jk_series_error, Std_M='std')
         .reset_index()
     )
-    df_g['Std_M'] = df_g['Std_M'].fillna(0.0)
+    df_g[['Err_M', 'Std_M']] = df_g[['Err_M', 'Std_M']].fillna(0.0)
     return df_g
 
 
-def load_mk(fm):
-    """``(W, Mk)`` of the ``MK_MODEL`` curve at P = ``MK_P`` for ensemble ``fm``."""
-    fp = os.path.join(DATA_DIR, f'M_curves_{MK_MODEL}.csv')
+# --------------------------------------------------------------------------- real-data diagnostics
+# CSVs and plots only; nothing downstream reads them.  All use omega > 0: the
+# omega = 0 anchor row is M = 0 exactly, with no spread.
+
+def _real_groups(data):
+    """{(fm, p, w): M-array} of the real data, omega > 0."""
+    data = data[data.W > 0]
+    return {k: t['M'].to_numpy(dtype=float) for k, t in data.groupby(['FM', 'P', 'W'])}
+
+
+def plot_mean_median_and_qq(data):
+    """Mean vs median per (FM, P, W) cell (symmetry) and a normal Q-Q plot of the pooled
+    standardised residuals z = (M - mean) / std (whole shape: skew and tails), side by side.
+    Checks the normal draw in ``generate_synthetic_exp_data``.  Writes Images/mean_median_and_qq.png."""
+    groups = _real_groups(data)
+    mean = np.array([x.mean() for x in groups.values()])
+    median = np.array([np.median(x) for x in groups.values()])
+    z = np.concatenate([(x - x.mean()) / x.std(ddof=1) for x in groups.values()])
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5.5), dpi=PLOT_DPI)
+    lo, hi = min(mean.min(), median.min()), max(mean.max(), median.max())
+    ax1.plot([lo, hi], [lo, hi], 'k--', lw=1, label='y = x')
+    ax1.scatter(mean, median, s=14, alpha=0.6)
+    ax1.set_xlabel('mean(M)')
+    ax1.set_ylabel('median(M)')
+    ax1.set_title('mean vs median')
+    ax1.legend()
+
+    stats.probplot(z, dist='norm', plot=ax2)
+    pts = ax2.get_lines()[0]
+    pts.set_markersize(2)
+    pts.set_alpha(0.3)
+    pts.set_rasterized(True)            # ~1e5 points
+    ax2.set_title('qq-normal')
+    fig.tight_layout()
+    fig.savefig(os.path.join(IMG_DIR, 'mean_median_and_qq.png'), format='png', dpi=PLOT_DPI)
+    plt.close(fig)
+
+
+def _poly_r2(x, y, deg):
+    """R^2 of a degree-``deg`` polynomial fit to (x, y); (nan, None) if too few points."""
+    if len(x) <= deg:
+        return np.nan, None
+    coeffs = np.polyfit(x, y, deg)
+    ss_res = np.sum((y - np.polyval(coeffs, x)) ** 2)
+    ss_tot = np.sum((y - y.mean()) ** 2)
+    return (float(1.0 - ss_res / ss_tot) if ss_tot > 0 else np.nan), coeffs
+
+
+def check_linearity(data, quad_r2_gain=0.02):
+    """Is mean(M) and std(M) vs omega linear, per (FM, P)?  The std line is the noise
+    model of ``extrapolate_std_to_new_M``.
+
+    A line and a quadratic are fit; if the quadratic improves R^2 by less than
+    ``quad_r2_gain`` the curve is called linear.  A quadratic through 3 points is
+    exact, so the verdict needs n >= 4 (FM=15 keeps 3 omega values: 'too few points').
+    Descriptive only (3-5 omega points per curve).  Writes linearity_check.csv.
+    """
+    rows = []
+    for fm in sorted(data.FM.unique()):
+        df_g = real_mean_M(data[data.W > 0], fm)
+        for p in sorted(df_g.P.unique()):
+            t = df_g[df_g.P == p].sort_values('W')
+            w = t['W'].to_numpy(dtype=float)
+            for quantity, col in (('mean', 'Mean_M'), ('std', 'Std_M')):
+                y = t[col].to_numpy(dtype=float)
+                r2_lin, _ = _poly_r2(w, y, 1)
+                r2_quad, _ = _poly_r2(w, y, 2)
+                gain = r2_quad - r2_lin
+                if len(w) < 4 or not np.isfinite(gain):
+                    verdict = 'too few points'
+                else:
+                    verdict = 'linear' if gain < quad_r2_gain else 'non-linear'
+                rows.append({'FM': fm, 'P': p, 'quantity': quantity, 'n': len(w),
+                             'r2_linear': r2_lin, 'r2_quadratic': r2_quad,
+                             'r2_gain': gain, 'verdict': verdict})
+
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join(DATA_DIR, 'linearity_check.csv'), index=False)
+    print('\nlinear vs non-linear trend vs omega, per (FM, P):')
+    print(df.pivot_table(index=['FM', 'P'], columns='quantity',
+                         values='verdict', aggfunc='first').to_string())
+    print('\nmean R^2 of the linear fit, per FM:')
+    print(df.pivot_table(index='FM', columns='quantity', values='r2_linear').round(3).to_string())
+    return df
+
+
+def _plot_by_p(data, col, ylabel, out_prefix):
+    """Per FM: ``col`` vs omega (omega > 0), one curve per P, with its linear fit."""
+    for fm in sorted(data.FM.unique()):
+        df_g = real_mean_M(data[data.W > 0], fm)
+        plt.figure(dpi=PLOT_DPI)
+        for p in sorted(df_g.P.unique()):
+            t = df_g[df_g.P == p].sort_values('W')
+            w, y = t['W'].to_numpy(dtype=float), t[col].to_numpy(dtype=float)
+            line, = plt.plot(w, y, 'o', label=fr'$p_z$={p}')
+            r2, coeffs = _poly_r2(w, y, 1)
+            if coeffs is not None:
+                plt.plot(w, np.polyval(coeffs, w), '--', color=line.get_color(), lw=1,
+                         label=fr'linear fit ($R^2$={r2:.3f})')
+        plt.xlabel(r'$\omega$')
+        plt.ylabel(ylabel)
+        plt.title(f'FM={fm}')
+        plt.legend(fontsize=10, ncol=2)
+        plt.savefig(os.path.join(IMG_DIR, f'{out_prefix}_FM_{fm}.png'), format='png', dpi=PLOT_DPI)
+        plt.close()
+
+
+def plot_mean_vs_w(data):
+    """Images/Mean_vs_W_FM_{fm}.png: mean(M) vs omega per P, with linear fits."""
+    _plot_by_p(data, 'Mean_M', 'mean(M)', 'Mean_vs_W')
+
+
+def plot_std_vs_w(data):
+    """Images/Std_vs_W_FM_{fm}.png: std(M) vs omega per P, with the linear noise-model fit."""
+    _plot_by_p(data, 'Std_M', 'std(M)', 'Std_vs_W')
+
+
+def plot_real_jackknife(data):
+    """Real M with its jackknife error over Exp, one column per FM.
+
+    Top: mean M +- sigma_JK vs omega per P (sigma_JK = sqrt(N-1) std, the Exp rows
+    being jackknife samples).  Bottom: sigma_JK itself vs omega on a log axis.
+    Writes real_M_jackknife.csv (FM, P, W, Mean_M, Err_M, N) and Images/real_M_jackknife.png.
+    """
+    data = data[data.W > 0]
+    fms = sorted(data.FM.unique())
+    fig, axes = plt.subplots(2, len(fms), figsize=(6.5 * len(fms), 10), dpi=PLOT_DPI,
+                             sharex='col', squeeze=False)
+    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    rows = []
+    for c, fm in enumerate(fms):
+        df_g = real_mean_M(data, fm)
+        df_g['N'] = data[data.FM == fm].groupby(['P', 'W'])['M'].count().to_numpy()
+        rows.append(df_g.assign(FM=fm)[['FM', 'P', 'W', 'Mean_M', 'Err_M', 'N']])
+        ax, axe = axes[0, c], axes[1, c]
+        for k, p in enumerate(sorted(df_g.P.unique())):
+            t = df_g[df_g.P == p].sort_values('W')
+            col = colors[k % len(colors)]
+            ax.errorbar(t.W, t.Mean_M, yerr=t.Err_M, fmt='o-', ms=4, lw=1, capsize=3,
+                        color=col, label=fr'$p_z$={p}')
+            axe.plot(t.W, t.Err_M, 'o-', ms=4, lw=1, color=col, label=fr'$p_z$={p}')
+        n_lo, n_hi = df_g.N.min(), df_g.N.max()
+        ax.set_title(f'FM={fm}  (N={n_lo if n_lo == n_hi else f"{n_lo}-{n_hi}"} configurations)',
+                     fontsize=13)
+        axe.set_yscale('log')
+        axe.set_xlabel(r'$\omega$', fontsize=14)
+        for a in (ax, axe):
+            a.grid(alpha=0.25, lw=0.5)
+            a.tick_params(which='both', labelsize=11)
+        if c == 0:
+            ax.set_ylabel(r'$\Delta\mathfrak{M}(\omega)\ \pm\ \sigma_{JK}$', fontsize=14)
+            axe.set_ylabel(r'$\sigma_{JK}$ (jackknife error)', fontsize=14)
+            ax.legend(fontsize=10)
+    fig.suptitle('Real lattice data, jackknife error over configurations', fontsize=15)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(os.path.join(IMG_DIR, 'real_M_jackknife.png'), format='png', dpi=PLOT_DPI)
+    plt.close(fig)
+    pd.concat(rows, ignore_index=True).to_csv(os.path.join(DATA_DIR, 'real_M_jackknife.csv'),
+                                              index=False)
+
+
+def real_data_diagnostics(data):
+    plot_real_jackknife(data)
+    plot_mean_median_and_qq(data)
+    check_linearity(data)
+    plot_mean_vs_w(data)
+    plot_std_vs_w(data)
+
+
+def load_mk(fm, mk_model):
+    """``(W, Mk)`` of the ``mk_model`` curve at P = ``MK_P`` for ensemble ``fm``."""
+    fp = os.path.join(DATA_DIR, f'M_curves_{mk_model}.csv')
     if not os.path.exists(fp):
-        raise FileNotFoundError(f'{fp} not found -- run  python model_selection.py --curves {MK_MODEL}')
+        raise FileNotFoundError(f'{fp} not found -- run  python model_selection.py --curves')
     df = pd.read_csv(fp)
     g = df[(df.FM == int(fm)) & (df.P == MK_P)].sort_values('W')
     if g.empty:
@@ -150,8 +328,8 @@ def plot_I_omega(df_I):
     plt.close()
 
 
-def plot_real_vs_synthetic(df_g, est_full, fm, full_range=False):
-    """One panel per P: real mean M (+/- std) points vs the synthetic M(omega) curve.
+def plot_real_vs_synthetic(df_g, est_full, fm, mk_model, full_range=False):
+    """One panel per P: real mean M (+/- jackknife error) points vs the synthetic M(omega) curve.
     ``full_range`` -- if True show omega up to 20, else zoom to the real data range."""
     all_p = sorted(df_g.P.unique())
     ncols = 3
@@ -164,7 +342,7 @@ def plot_real_vs_synthetic(df_g, est_full, fm, full_range=False):
         s = est_full[est_full.P == p].sort_values('W')
 
         ax.plot(s.W, s.Est_M, '-', color='tab:orange', lw=2, label='synthetic', zorder=1)
-        ax.errorbar(r.W, r.Mean_M, yerr=r.Std_M, fmt='^', color='tab:blue', ms=7,
+        ax.errorbar(r.W, r.Mean_M, yerr=r.Err_M, fmt='^', color='tab:blue', ms=7,
                     capsize=3, label='real', zorder=2)
 
         if not full_range:
@@ -183,7 +361,7 @@ def plot_real_vs_synthetic(df_g, est_full, fm, full_range=False):
     for ax in axes.flat[len(all_p):]:
         ax.set_visible(False)
 
-    fig.suptitle(f'FM={fm}   M at P={MK_P} from {MK_MODEL}')
+    fig.suptitle(f'FM={fm}   M at P={MK_P} from {mk_model}')
     fig.tight_layout()
     suffix = '_full' if full_range else ''
     fig.savefig(os.path.join(IMG_DIR, f'M_real_vs_synthetic_FM_{fm}{suffix}.png'),
@@ -192,19 +370,20 @@ def plot_real_vs_synthetic(df_g, est_full, fm, full_range=False):
 
 
 def generate_m_omega():
-    """Per FM: Mk = the ``MK_MODEL`` curve at P = ``MK_P`` (omega = 0..20), then
-    M1..M{N_P} and I from ``estimate_M_values``.
+    """Per FM: Mk = the best model_selection fit's curve at P = ``MK_P`` (omega = 0..20),
+    then M1..M{N_P} and I from ``estimate_M_values``.
 
     Writes ``new_M.csv`` (FM, P, W, Est_M), ``I_omega_estimated.csv`` (FM, W, I),
     ``loss_val_FM_{fm}.csv`` (epoch, loss_M) and ``M_real_vs_est_FM_{fm}.csv``
     (real cell means vs the estimate interpolated onto the real omega).
     """
     data = pd.read_csv(os.path.join(DATA_DIR, 'All_p_w_m.csv'))
+    mk_model = best_model()
 
     all_new_M, all_I = [], []
     for fm in sorted(data.FM.unique()):
         df_g = real_mean_M(data, fm)
-        W, Mk = load_mk(fm)
+        W, Mk = load_mk(fm, mk_model)
 
         m_dict, df_loss = estimate_M_values(Mk, W, n_p=N_P)
         df_loss.to_csv(os.path.join(DATA_DIR, f'loss_val_FM_{fm}.csv'), index=False)
@@ -221,8 +400,8 @@ def generate_m_omega():
         df_cmp['Est_M'] = [np.interp(w, W, m_dict[f'M{int(p)}']) for p, w in zip(df_cmp.P, df_cmp.W)]
         df_cmp.sort_values(['P', 'W']).to_csv(os.path.join(DATA_DIR, f'M_real_vs_est_FM_{fm}.csv'), index=False)
 
-        plot_real_vs_synthetic(df_g, est_full, fm)
-        plot_real_vs_synthetic(df_g, est_full, fm, full_range=True)
+        plot_real_vs_synthetic(df_g, est_full, fm, mk_model)
+        plot_real_vs_synthetic(df_g, est_full, fm, mk_model, full_range=True)
 
         mean_abs = np.abs(df_cmp['Mean_M'] - df_cmp['Est_M']).mean()
         print(f'FM={fm}: {len(df_loss)} epochs, final loss_M={df_loss.loss_M.iloc[-1]:.3g}, '
@@ -344,10 +523,16 @@ def generate_m_omega_from_distribution(seed=12345):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', type=int, default=12345)
+    parser.add_argument('--diagnostics_only', action='store_true',
+                        help='only the real-data diagnostics (Q-Q, mean/std vs omega, linearity); '
+                             'no synthetic data is written')
     args = parser.parse_args()
 
     # build the real-data file from the raw rpitd files only if it is missing
     if not os.path.exists(os.path.join(DATA_DIR, 'All_p_w_m.csv')):
         create_combined_data()
+    real_data_diagnostics(pd.read_csv(os.path.join(DATA_DIR, 'All_p_w_m.csv')))
+    if args.diagnostics_only:
+        raise SystemExit
     generate_m_omega()
     generate_m_omega_from_distribution(seed=args.seed)

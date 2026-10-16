@@ -12,7 +12,7 @@ Input, per lattice spacing FM in {9, 12, 15} (a = 0.0888, 0.1207, 0.151 fm):
         from `reconstruct_real_data.py --anchor_real --n_draws K --models GP`:
         each Exp follows its own real data over the measured range, and the GP
         latent draws carry the model uncertainty of the extrapolated tail.  Each
-        bootstrap sample adds one draw's shift (draw k - draw 0), chosen
+        Monte Carlo sample adds one draw's shift (draw k - draw 0), chosen
         independently per FM since every FM has its own GP.
     --source roll
         Data/2026/Real_data_projected_{fm}_no_exp_v2.csv  (plain seed-only roll)
@@ -40,13 +40,14 @@ chi^2/dof ~ 1e9 and a meaningless one-hot model choice.  The fit is therefore
 ordinary least squares and its uncertainty is taken from its own residuals,
 i.e. from how well the cutoff form actually describes the three spacings.
 
-Uncertainty (one combined sample per bootstrap draw b = 1..n_boot):
-  * configurations -- resample Exp with replacement independently per FM
-    (separate ensembles), average, refit;
-  * fit            -- add a draw from N(0, s^2 (X^T X)^-1) on M0, s^2 = RSS/dof;
-  * I(omega) is rebuilt from each sample; 'stat' = bootstrap 68% half-width;
-  * cutoff form    -- 'sys' = weighted spread of the central I across forms.
-  Total sigma = stat (+) sys in quadrature; bands at 68% (1 sigma) and 95% (1.96 sigma).
+Uncertainty, each component on the form-weighted I(omega):
+  * stat  -- jackknife (jackknife.py): per FM, every Exp row (a jackknife
+             sample) is refit and I rebuilt, the other FMs held
+             at their mean (separate ensembles); per-FM variances add;
+  * fit   -- --n_draws draws from N(0, s^2 (X^T X)^-1) on M0, s^2 = RSS/dof (std);
+  * model -- GP latent draws, one per FM per draw, when present (std);
+  * sys   -- weighted spread of the central I across cutoff forms.
+  Total sigma = all four in quadrature; bands at 1 sigma and 1.96 sigma.
 Form weights (--weights): 'equal' (default) or 'aic' (n ln(RSS/n) + 2k).  The
 residuals are strongly correlated in omega (the curves are smooth), so AIC's
 independent-point assumption overstates the evidence and tends to pick one form
@@ -59,7 +60,7 @@ identical to test_error.py so the result is comparable with the per-FM curves.
 
 Writes
     Data/2026/I_omega_continuum_M_{model}.csv
-        omega, I, I_lo68, I_hi68, I_lo95, I_hi95, sigma_stat, sigma_sys,
+        omega, I, I_lo68, I_hi68, I_lo95, I_hi95, sigma_stat, sigma_fit, sigma_model, sigma_sys,
         I_<form> (central, per form), I_FM<fm> (per-spacing, same recipe)
     Data/2026/M_continuum_fit_{model}.csv     per-(P, form) RMS residual, AIC, theta
     Data/2026/Images/I_omega_continuum_M_{model}.{png,pdf}
@@ -67,7 +68,7 @@ Writes
 The model is the overall #1 (FM == 'all') in Data/2026/train_test_error_no_exp.csv;
 latent draws exist only for GP, otherwise the band is configurations + fit only.
 
-Run from Helicity/Code:  python continuum_M_extrapolation.py [--n_boot 500]
+Run from Helicity/Code:  python continuum_M_extrapolation.py [--n_draws 500]
 """
 
 import argparse
@@ -80,6 +81,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.ticker import MultipleLocator
 
+from jackknife import jk_error
 from test_error import MIN_P, SMOOTH_WINDOW, best_model, get_smooth_curve
 
 FM_TO_A = {9: 0.0888, 12: 0.1207, 15: 0.151}     # fm, from the rpitd file headers
@@ -188,7 +190,7 @@ def smooth_I(I, omega, window):
 
 # --------------------------------------------------------------------------- main
 
-def run(data_dir, model, n_boot, seed, window, weighting, source):
+def run(data_dir, model, n_draws, seed, window, weighting, source):
     suffix = '_anchored' if source == 'anchored' else ''
     reps, P, W = load_replicas(data_dir, model, suffix)
     shifts = load_draw_shifts(data_dir, model, suffix, P, W)
@@ -201,21 +203,11 @@ def run(data_dir, model, n_boot, seed, window, weighting, source):
     x = omega / omega.max()
     n_w = len(omega)
 
-    mean = np.stack([reps[f].mean(axis=1) for f in fms])       # (n_FM, n_P, n_W)
-
+    mean = np.stack([np.nanmean(reps[f], axis=1) for f in fms])   # (n_FM, n_P, n_W)
     rng = np.random.default_rng(seed)
-    boot = np.empty((n_boot, len(fms), len(P), len(W)))        # bootstrap Exp-means
-    for f_i, f in enumerate(fms):
-        n_exp = reps[f].shape[1]
-        for b in range(n_boot):
-            boot[b, f_i] = reps[f][:, rng.integers(0, n_exp, n_exp), :].mean(axis=1)
-        if shifts is not None:              # + one GP latent draw (independent model per FM)
-            boot[:, f_i] += shifts[f][rng.integers(0, len(shifts[f]), n_boot)]
 
-    M0_c, M0_b, fit_rows = {}, {}, []
+    ops, chol, fit_rows = {}, {}, []                # per (form, P): LSQ operator, fit-cov factor
     for form in FORMS:
-        M0_c[form] = np.zeros((len(P), len(W)))
-        M0_b[form] = np.zeros((n_boot, len(P), len(W)))
         for k, p in enumerate(P):
             unit = np.array([unit_map[(f, p)] for f in fms])
             X, S = design(form, a, unit, omega, x)
@@ -223,20 +215,24 @@ def run(data_dir, model, n_boot, seed, window, weighting, source):
             coef = S @ y
             rss = float(np.sum((y - X @ coef) ** 2))
             n, n_par = len(y), X.shape[1]
-            s2 = rss / (n - n_par)
-            M0_c[form][k, fit] = coef[:n_w]
-
-            # configuration bootstrap refit + fit-residual draw on M0
-            yb = boot[:, :, k, :][:, :, fit].reshape(n_boot, -1)
-            cov = s2 * (S @ S.T)[:n_w, :n_w]                  # = s^2 (X^T X)^-1 block
+            cov = rss / (n - n_par) * (S @ S.T)[:n_w, :n_w]   # = s^2 (X^T X)^-1 block on M0
             evals, evecs = np.linalg.eigh(cov)
-            L = evecs * np.sqrt(np.clip(evals, 0.0, None))
-            M0_b[form][:, k, fit] = (yb @ S.T)[:, :n_w] + rng.standard_normal((n_boot, n_w)) @ L.T
-
+            ops[form, k] = S
+            chol[form, k] = evecs * np.sqrt(np.clip(evals, 0.0, None))
             fit_rows.append({'P': p, 'form': form, 'n': n, 'n_par': n_par,
                              'RMS_resid': np.sqrt(rss / n),
                              'AIC': n * np.log(rss / n) + 2 * n_par,
                              'theta': coef[n_w:].round(5).tolist()})
+
+    def continuum_I(Ms, form, noise=None):
+        """I(omega) per sample from stacked M (n_s, n_FM, n_P, n_W) via the a -> 0 fit;
+        ``noise`` (n_s, n_w) standard normals adds a fit-residual draw on M0."""
+        M0 = np.zeros((len(Ms), len(P), len(W)))
+        for k in range(len(P)):
+            M0[:, k, fit] = (Ms[:, :, k, fit].reshape(len(Ms), -1) @ ops[form, k].T)[:, :n_w]
+            if noise is not None:
+                M0[:, k, fit] += noise @ chol[form, k].T
+        return smooth_I(pair_I(M0, P), W, window)
 
     fits = pd.DataFrame(fit_rows)
     # forms used for I(omega): only P >= MIN_P enter the pair relation
@@ -251,16 +247,35 @@ def run(data_dir, model, n_boot, seed, window, weighting, source):
     print('AIC weights:', w_aic.round(4).to_dict(), f'| using {weighting} weights:',
           w_form.round(3).to_dict())
 
-    I_c = {f: smooth_I(pair_I(M0_c[f], P), W, window) for f in FORMS}
-    I_b = {f: smooth_I(pair_I(M0_b[f], P), W, window) for f in FORMS}
-
     wv = w_form.to_numpy()
+    form_avg = lambda Ms, **kw: sum(wv[i] * continuum_I(Ms, f, **kw) for i, f in enumerate(FORMS))
+    I_c = {f: continuum_I(mean[None], f)[0] for f in FORMS}
     I_avg = sum(wv[i] * I_c[f] for i, f in enumerate(FORMS))
-    I_avg_b = sum(wv[i] * I_b[f] for i, f in enumerate(FORMS))
-    lo, hi = np.percentile(I_avg_b, [16, 84], axis=0)
-    s_stat = (hi - lo) / 2
+
+    # statistical: jackknife over configurations, one FM at a time (independent
+    # ensembles, the others held at their mean); the variances add
+    var_stat = np.zeros(len(W))
+    for f_i, f in enumerate(fms):
+        Ms = np.repeat(mean[None], reps[f].shape[1], axis=0)
+        Ms[:, f_i] = np.moveaxis(reps[f], 1, 0)
+        var_stat += jk_error(form_avg(Ms), axis=0) ** 2
+    s_stat = np.sqrt(var_stat)
+
+    # fit residual: draws from N(0, s^2 (X^T X)^-1) on M0 (a parametric fit error,
+    # not a configuration resample, so its spread is a plain std)
+    noise = rng.standard_normal((n_draws, n_w))
+    s_fit = form_avg(np.repeat(mean[None], n_draws, axis=0), noise=noise).std(axis=0, ddof=1)
+
+    # model: GP latent draws (independent model per FM), when present
+    s_model = np.zeros(len(W))
+    if shifts is not None:
+        Ms = np.repeat(mean[None], n_draws, axis=0)
+        for f_i, f in enumerate(fms):
+            Ms[:, f_i] += shifts[f][rng.integers(0, len(shifts[f]), n_draws)]
+        s_model = form_avg(Ms).std(axis=0, ddof=1)
+
     s_sys = np.sqrt(sum(wv[i] * (I_c[f] - I_avg) ** 2 for i, f in enumerate(FORMS)))
-    s_tot = np.hypot(s_stat, s_sys)
+    s_tot = np.sqrt(s_stat ** 2 + s_fit ** 2 + s_model ** 2 + s_sys ** 2)
 
     # per-spacing curves with the identical recipe, for comparison
     I_fm = {f: smooth_I(pair_I(mean[i], P), W, window) for i, f in enumerate(fms)}
@@ -269,7 +284,8 @@ def run(data_dir, model, n_boot, seed, window, weighting, source):
     out = pd.DataFrame({'omega': W, 'I': I_avg,
                         'I_lo68': clip(I_avg - s_tot), 'I_hi68': I_avg + s_tot,
                         'I_lo95': clip(I_avg - 1.96 * s_tot), 'I_hi95': I_avg + 1.96 * s_tot,
-                        'sigma_stat': s_stat, 'sigma_sys': s_sys,
+                        'sigma_stat': s_stat, 'sigma_fit': s_fit, 'sigma_model': s_model,
+                        'sigma_sys': s_sys,
                         **{f'I_{f}': I_c[f] for f in FORMS},
                         **{f'I_FM{f}': I_fm[f] for f in fms}})
     out_csv = os.path.join(data_dir, f'I_omega_continuum_M_{model}{suffix}.csv')
@@ -278,11 +294,13 @@ def run(data_dir, model, n_boot, seed, window, weighting, source):
     fits.to_csv(fit_csv, index=False)
     print(f'\ncontinuum I(omega) -> {out_csv}\nfit summary -> {fit_csv}')
     i_pk = int(np.argmax(I_avg))
-    print(f'peak I = {I_avg[i_pk]:.4f} +- {s_tot[i_pk]:.4f} (stat {s_stat[i_pk]:.4f}, '
-          f'sys {s_sys[i_pk]:.4f}) at omega = {W[i_pk]:.1f}')
+    print(f'peak I = {I_avg[i_pk]:.4f} +- {s_tot[i_pk]:.4f} (stat/jackknife {s_stat[i_pk]:.2e}, '
+          f'fit {s_fit[i_pk]:.4f}, model {s_model[i_pk]:.4f}, sys {s_sys[i_pk]:.4f}) '
+          f'at omega = {W[i_pk]:.1f}')
 
-    band = ('per-configuration real data + GP latent draws' if shifts is not None
-            else 'configuration bootstrap') + r' + fit residual $\oplus$ cutoff-form spread'
+    band = (r'jackknife $\oplus$ fit residual'
+            + (r' $\oplus$ GP latent draws' if shifts is not None else '')
+            + r' $\oplus$ cutoff-form spread')
     plot(out, fms, a, w_form, weighting, max(reach.values()), model, band,
          os.path.join(data_dir, 'Images', f'I_omega_continuum_M_{model}{suffix}'))
 
@@ -293,8 +311,8 @@ def plot(out, fms, a, w_form, weighting, w_real, model, band, out_base):
     for k, (fm, av) in enumerate(zip(fms, a)):
         ax.plot(w, out[f'I_FM{fm}'], STYLES[k % len(STYLES)], lw=1.2, alpha=0.8,
                 color=COLORS[k % len(COLORS)], label=f'$a={av:.3f}$ fm (FM={fm})')
-    ax.fill_between(w, out.I_lo95, out.I_hi95, color='0.2', alpha=0.12, lw=0, label='95% CI')
-    ax.fill_between(w, out.I_lo68, out.I_hi68, color='0.2', alpha=0.28, lw=0, label='68% CI')
+    ax.fill_between(w, out.I_lo95, out.I_hi95, color='0.2', alpha=0.12, lw=0, label=r'$\pm1.96\sigma$')
+    ax.fill_between(w, out.I_lo68, out.I_hi68, color='0.2', alpha=0.28, lw=0, label=r'$\pm1\sigma$')
     wtxt = ', '.join(f'{FORM_LABEL[f]} {w_form[f]:.2f}' for f in FORMS)
     ax.plot(w, out.I, '-', lw=2.4, color='0.05',
             label=f'continuum $a\\to0$ ({weighting} weights: {wtxt})')
@@ -324,7 +342,8 @@ def plot(out, fms, a, w_form, weighting, w_real, model, band, out_base):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", default='../Data/2026')
-    parser.add_argument("--n_boot", type=int, default=500, help="bootstrap samples over Exp")
+    parser.add_argument("--n_draws", type=int, default=500,
+                        help="Monte Carlo draws for the fit-residual and GP-draw terms")
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--weights", choices=['equal', 'aic'], default='equal',
                         help="how the cutoff forms are combined")
@@ -334,5 +353,5 @@ if __name__ == "__main__":
                         help="anchored: reconstruct_real_data.py --anchor_real output (+ GP draws "
                              "if present); roll: the plain seed-only roll")
     args = parser.parse_args()
-    run(args.data_dir, best_model(args.data_dir), args.n_boot, args.seed, args.smooth_window, args.weights,
+    run(args.data_dir, best_model(args.data_dir), args.n_draws, args.seed, args.smooth_window, args.weights,
         args.source)
