@@ -43,7 +43,7 @@ processes only the no_exp files (VARIANT) and, per FM:
     and only the top three are plotted (M with the real data overlaid, and I).
     The single best model's smoothed I(w) for every FM is also drawn on one axis:
         Data/2026/Images/best_model_I_no_exp_{model}.png
-        Data/2026/best_model_I_no_exp_{model}.csv     (FM, W, smoothed I)
+        Data/2026/best_model_I_no_exp_{model}.csv     (FM, W, smoothed I, jackknife Err)
 
 Run from Helicity/Code:  python test_error.py
 """
@@ -302,7 +302,7 @@ class Test_Error:
             ax.annotate(f'FM={fm}', (w[i], y[i]), xytext=(0, 6), textcoords='offset points',
                         ha='center', va='bottom', fontsize=9, color='0.2')
             w_anchor = max(w_anchor, w_anc)
-            curves.append(pd.DataFrame({'FM': fm, 'W': w, 'I': y}))
+            curves.append(pd.DataFrame({'FM': fm, 'W': w, 'I': y, 'Err': e}))
         if curves:
             out_csv = os.path.join(self.data_dir, f'best_model_I_{VARIANT}_{best}.csv')
             pd.concat(curves, ignore_index=True).to_csv(out_csv, index=False)
