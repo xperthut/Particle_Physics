@@ -9,6 +9,7 @@ dependencies:
   - scikit-learn
   - scikit-optimize
   - xgboost
+  - pytorch
   - joblib
   - matplotlib
   - seaborn

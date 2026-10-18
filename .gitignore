@@ -24,6 +24,7 @@ env/
 *.log
 Code/*.ipynb
 Code/*.txt
+DeepQCD/*.txt
 
 # Data: only .txt files are tracked (raw/source data). Generated .csv
 # frames, plots, zips, intermediate binaries, etc. under a Data/ folder are
@@ -31,6 +32,8 @@ Code/*.txt
 **/Data/**
 !**/Data/**/
 !**/Data/**/*.txt
+# DeepQCD training logs are .txt but not source data
+**/Data/DeepQCD/train_log_*
 
 **/OtherWay/**
 
