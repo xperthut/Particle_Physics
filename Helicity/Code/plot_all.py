@@ -7,6 +7,7 @@ missing inputs is skipped (the missing files are listed) and the rest still run.
 
 Figures (all written to Data/2026/Images/):
     real_diagnostics   real_M_jackknife, mean_median_and_qq, Mean_vs_W_FM_*, Std_vs_W_FM_*
+    real_M_jk_by_FM    real_M_jk_by_FM                 (real M +- sigma_JK, FM panels side by side)
     real_vs_synthetic  M_real_vs_synthetic_FM_*[_full]
     I_estimated        I(w)_estimated
     model_selection    model_selection_FM_*
@@ -79,6 +80,37 @@ class Job:
 
 # --------------------------------------------------------------------------- real data / synthetic
 
+def plot_real_M_jk_by_FM():
+    """Real M(omega) per P with jackknife error bars, one panel per FM, shared y-axis.
+
+    The Exp rows are jackknife samples, so sigma_JK = sqrt(N-1) * std over Exp;
+    the Z=0 (W=0, M=0) anchor rows are dropped.
+    """
+    df = pd.read_csv(REAL)
+    df = df[df.Z != 0]
+    stats = (df.groupby(['FM', 'P', 'Z'])
+               .agg(W=('W', 'first'), mean=('M', 'mean'), std=('M', 'std'), N=('M', 'size'))
+               .reset_index())
+    stats['err'] = np.sqrt(stats.N - 1) * stats['std']
+
+    fms = sorted(stats.FM.unique())
+    fig, axes = plt.subplots(1, len(fms), figsize=(6 * len(fms), 5), sharey=True)
+    for ax, fm in zip(axes, fms):
+        s = stats[stats.FM == fm]
+        for p, g in s.groupby('P'):
+            ax.errorbar(g.W, g['mean'], yerr=g.err, fmt='o-', ms=4, capsize=3, label=f'$p_z$={p}')
+        ax.axhline(0, color='grey', lw=0.5)
+        ax.set_title(f'FM={fm}  (N={s.N.iloc[0]} configs)')
+        ax.set_xlabel(r'$\omega$')
+        ax.grid(alpha=0.3)
+    axes[0].set_ylabel(r'$\mathfrak{M}(\omega) \pm \sigma_{JK}$')
+    axes[0].legend()
+    fig.tight_layout()
+    out = os.path.join(IMG_DIR, 'real_M_jk_by_FM.png')
+    fig.savefig(out, dpi=200)
+    print(f'plot -> {out}')
+
+
 def jobs_synthetic():
     def real_diagnostics():
         df = pd.read_csv(REAL)
@@ -107,6 +139,7 @@ def jobs_synthetic():
 
     return [
         Job('real_diagnostics', 'real_diagnostics', [REAL], real_diagnostics),
+        Job('real_M_jk_by_FM', 'real_M_jk_by_FM', [REAL], plot_real_M_jk_by_FM),
         Job('real_vs_synthetic', 'real_vs_synthetic',
             [REAL, data('new_M.csv'), data('model_selection_summary.csv')], real_vs_synthetic),
         Job('I_estimated', 'I_estimated', [data('I_omega_estimated.csv')], I_estimated),
@@ -287,7 +320,7 @@ def jobs_continuum():
 
 # --------------------------------------------------------------------------- driver
 
-GROUPS = ['real_diagnostics', 'real_vs_synthetic', 'I_estimated', 'model_selection', 'M_curves',
+GROUPS = ['real_diagnostics', 'real_M_jk_by_FM', 'real_vs_synthetic', 'I_estimated', 'model_selection', 'M_curves',
           'projected_I', 'best_model_I', 'I_all_FM', 'continuum', 'continuum_jk', 'continuum_M']
 
 
