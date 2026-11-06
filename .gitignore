@@ -29,15 +29,19 @@ DeepQCDConstraint/*.txt
 Helicity/Code/method.md
 Helicity/DeepQCDConstraint/method.md
 
-# Data: only .txt files are tracked (raw/source data). Generated .csv
-# frames, plots, zips, intermediate binaries, etc. under a Data/ folder are
-# produced by the pipeline scripts and left untracked.
-Helicity/Data/**
-!**/Data/**/
-!**/Data/**/*.txt
-# DeepQCD training logs are .txt but not source data
-**/Data/DeepQCD/*.txt
-**/Data/DeepQCDConstraint/*.txt
+# Helicity: only the 2024-publication material is shared — Code/ and the
+# raw .txt data in Data/2024/. Every other Helicity folder (DeepQCD,
+# DeepQCDConstraint, HelicityITDplots, RealLim, Report, Data/2026*, ...)
+# is post-publication work and stays private.
+Helicity/*
+!Helicity/Code/
+!Helicity/Data/
+
+# Data: nothing under any Data/ folder is shared (generated .csv frames,
+# zips, logs, newer data), except the raw .txt files of Helicity/Data/2024.
+**/Data/**
+!Helicity/Data/2024/
+!Helicity/Data/2024/*.txt
 
 **/OtherWay/**
 
