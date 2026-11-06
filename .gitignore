@@ -25,17 +25,19 @@ env/
 Code/*.ipynb
 Code/*.txt
 DeepQCD/*.txt
+DeepQCDConstraint/*.txt
 Helicity/Code/method.md
 Helicity/DeepQCDConstraint/method.md
 
 # Data: only .txt files are tracked (raw/source data). Generated .csv
 # frames, plots, zips, intermediate binaries, etc. under a Data/ folder are
 # produced by the pipeline scripts and left untracked.
-**/Data/**
+Helicity/Data/**
 !**/Data/**/
 !**/Data/**/*.txt
 # DeepQCD training logs are .txt but not source data
-**/Data/DeepQCD/train_log_*
+**/Data/DeepQCD/*.txt
+**/Data/DeepQCDConstraint/*.txt
 
 **/OtherWay/**
 
