@@ -11,13 +11,12 @@ processes only the no_exp files (VARIANT) and, per FM:
 
   * averages each model's M over the Exp replicas -> Mean_M_* / Err_M_* per (P, W),
     Err = jackknife error over the Exp rows, sqrt(N-1) std (jackknife.py);
-  * combines every momentum pair (2 <= p1 < p2; P=1 is left out of the pairs only --
-    it is still averaged, written and plotted as an M curve) into an Ioffe-time estimate
+  * combines the momentum pairs in I_PAIRS (default only (1, 2), i.e.
+    I = (4*M2 - M1) / 3; every P is still averaged, written and plotted as an
+    M curve) into an Ioffe-time estimate
         I(w) = (p2^2 * M(p2, w) - p1^2 * M(p1, w)) / (p2^2 - p1^2)
-    on the Exp-averaged mean curve, then averages the non-negative pair
-    estimates at each w (0 where every pair is negative).  With gamma=0,
-    synthetic_data_generator.py derives every M_k so that any pair inverts
-    to the same I(w).
+    on the Exp-averaged mean curve, then averages the pair estimates at each w
+    (negative values are kept, not clipped to 0).
 
   * smooths I(w) with a Savitzky-Golay filter (order-3 polynomial over a
     sliding window; --smooth_window points, default 60 -> 59 = 5.9 in omega).
@@ -77,7 +76,8 @@ VARIANT_TITLE = {'no_exp': 'without Exp feature', 'with_exp': 'with Exp feature'
 W_DECIMALS = 1
 SMOOTH_WINDOW = 60       # Savitzky-Golay window in grid points (0.1 each)
 SMOOTH_POLYORDER = 3
-MIN_P = 2                # smallest P allowed in an I(omega) pair; M curves keep every P (incl. P=1)
+# momentum pairs (p1, p2) whose estimates are averaged into I(omega); M curves keep every P
+I_PAIRS = [(1, 2)]
 N_SEED = 4               # seed-window points per P in reconstruct_real_data.py (N_LAGS)
 TOP_K = 3
 # Only the *_exp_No models are evaluated: Exp is an arbitrary replica label, so
@@ -88,12 +88,15 @@ _FILE_RE = re.compile(r'Real_data_projected_(.+)_(no_exp|with_exp)_v2\.csv$')
 
 
 def best_model(data_dir, variant=VARIANT):
-    """Overall #1 model (FM == 'all') in train_test_error_{variant}.csv, written by this script."""
-    path = os.path.join(data_dir, f'train_test_error_{variant}.csv')
+    """Overall #1 model in test_error_ranking_{variant}.csv, written by this script.
+
+    Same ranking run() uses to pick the model for best_model_I_{variant}_{model}.csv,
+    so it needs only test_error.py (not train_error.py).
+    """
+    path = os.path.join(data_dir, f'test_error_ranking_{variant}.csv')
     if not os.path.exists(path):
         raise FileNotFoundError(f'{path} not found -- run test_error.py first')
-    d = pd.read_csv(path, dtype={'FM': str})
-    best = d[d.FM == 'all'].sort_values('overall_rank').model.iloc[0]
+    best = pd.read_csv(path).sort_values('overall_rank').model.iloc[0]
     print(f'model: {best} (rank 1 overall in {path})')
     return best
 
@@ -154,30 +157,28 @@ class Test_Error:
         vals = ((p2 ** 2 * piv[p2] - p1 ** 2 * piv[p1]) / denom).to_numpy()
         return col, vals
 
-    def _I_rows(self, data, name, P, W):
+    def _I_rows(self, data, name, pairs, W):
         """Raw and smoothed I(w) on every Exp row (each a jackknife sample), with the
-        same pair rule as _compute_I; each (n_Exp, n_W).  Not clipped at 0, so the
-        jackknife spread is unbiased."""
+        same pair rule as _compute_I; each (n_Exp, n_W).  Negative values are kept."""
         cube = data.set_index(['P', 'Exp', 'W'])[f'M_{name}'].unstack('W').reindex(columns=W)
         exps = np.sort(data.Exp.unique())
-        M = {p: cube.loc[p].reindex(exps).to_numpy() for p in P}
-        E = np.stack([(j ** 2 * M[j] - i ** 2 * M[i]) / (j ** 2 - i ** 2)
-                      for i in P for j in P if i < j])
-        raw = np.nan_to_num(np.nanmean(np.where(E >= 0, E, np.nan), axis=0), nan=0.0)
+        M = {p: cube.loc[p].reindex(exps).to_numpy() for p in sorted({p for pr in pairs for p in pr})}
+        E = np.stack([(j ** 2 * M[j] - i ** 2 * M[i]) / (j ** 2 - i ** 2) for i, j in pairs])
+        raw = E.mean(axis=0)
         sm = np.apply_along_axis(get_smooth_curve, 1, raw, self.smooth_window)
         sm[:, W == 0.0] = 0.0
         return raw, sm
 
     def _compute_I(self, df_ms, names, data):
-        """I(w) averaged over every (MIN_P <= i < j) momentum pair, + smoothed I(w),
+        """I(w) averaged over the ``I_PAIRS`` momentum pairs, + smoothed I(w),
         each with its jackknife error over the Exp rows (Err_I_*, Err_smooth_I*).
 
-        At each W only the non-negative pair estimates enter the mean; if every
-        pair is negative there, I(w) is set to 0 (I is physically non-negative).
+        Plain mean of the pair estimates at each W; negative values are kept (no clip at 0).
         """
-        present = sorted(p for p in df_ms.P.unique() if p >= MIN_P)
-        if len(present) < 2:
-            print(f'  need at least two P >= {MIN_P}, have {present}; skipping I(omega)')
+        have = set(df_ms.P.unique())
+        pairs = [(i, j) for i, j in I_PAIRS if i in have and j in have]
+        if not pairs:
+            print(f'  none of the I_PAIRS {I_PAIRS} present (P = {sorted(have)}); skipping I(omega)')
             return None
 
         rows = {}
@@ -185,29 +186,17 @@ class Test_Error:
         for name in names:
             piv = (df_ms.pivot_table(index='W', columns='P', values=f'Mean_M_{name}')
                    .sort_index())
-            tmp = {}
-            for i in present:
-                for j in present:
-                    if i < j:
-                        c, v = self._I_omega(piv, i, j)
-                        tmp[c] = v
+            tmp = dict(self._I_omega(piv, i, j) for i, j in pairs)
             tmp = pd.DataFrame(tmp, index=piv.index)
-            rows[f'I_{name}'] = tmp.where(tmp >= 0).mean(axis=1).fillna(0.0).to_numpy()
+            rows[f'I_{name}'] = tmp.mean(axis=1).to_numpy()
         rows['W'] = np.round(piv.index.to_numpy(), W_DECIMALS)
 
         df_I = pd.DataFrame(rows).sort_values('W').reset_index(drop=True)
         for name in names:
             sm = get_smooth_curve(df_I[f'I_{name}'], self.smooth_window)
             sm = np.where(df_I['W'].to_numpy() == 0.0, 0.0, sm)   # I(0) = 0 exactly
-            # I(omega) is physically non-negative everywhere; the raw combination
-            # can dip slightly below 0 at small omega (real M is noisiest there,
-            # e.g. one anchored point sized to fit its own P but not the other's),
-            # and the Savitzky-Golay window then smears that dip into a visible
-            # negative glitch just past omega=0. Floor the *smoothed* curve only
-            # -- the raw I_* columns keep the unclipped values for diagnostics.
-            sm = np.clip(sm, 0.0, None)
             df_I[f'smooth_I{name}'] = sm
-            raw_rows, sm_rows = self._I_rows(data, name, present, df_I['W'].to_numpy())
+            raw_rows, sm_rows = self._I_rows(data, name, pairs, df_I['W'].to_numpy())
             df_I[f'Err_I_{name}'] = jk_error(raw_rows, axis=0)
             df_I[f'Err_smooth_I{name}'] = jk_error(sm_rows, axis=0)
         return df_I[['W'] + [f'I_{n}' for n in names] + [f'smooth_I{n}' for n in names]
@@ -260,7 +249,7 @@ class Test_Error:
                 axI.plot(df_I['W'], df_I[f'I_{name}'], '.', ms=4, alpha=0.35,
                          color=colors[0], label='raw')
                 sm, e = df_I[f'smooth_I{name}'], df_I[f'Err_smooth_I{name}']
-                axI.fill_between(df_I['W'], np.clip(sm - e, 0.0, None), sm + e,
+                axI.fill_between(df_I['W'], sm - e, sm + e,
                                  color=colors[3], alpha=0.3, lw=0, label=r'$\pm\sigma_{JK}$')
                 axI.plot(df_I['W'], sm, '-', lw=2, color=colors[3], label='smoothed')
                 if w_anchor and w_anchor > 0:
@@ -274,7 +263,8 @@ class Test_Error:
                        f'dashed line; beyond is extrapolation)' if w_anchor else '')
         top_note = f'top {len(names)} models by test error   ' if overall is not None else ''
         fig.suptitle(f'FM={fm}  [{VARIANT_TITLE.get(variant, variant)}]   {top_note}'
-                     f'I($\\omega$) averaged over all $p_z\\geq${MIN_P} pairs{anchor_note}')
+                     f'I($\\omega$) from $p_z$ pair(s) '
+                     f'{", ".join(f"{i}-{j}" for i, j in I_PAIRS)}{anchor_note}')
         fig.tight_layout(rect=(0, 0, 1, 0.97))   # leave room for the suptitle
         os.makedirs(self.img_dir, exist_ok=True)
         out_png = os.path.join(self.img_dir, f'projected_I_{variant}_{fm}.png')
@@ -296,7 +286,7 @@ class Test_Error:
             w, y = df_I['W'].to_numpy(), df_I[f'smooth_I{best}'].to_numpy()
             e = df_I[f'Err_smooth_I{best}'].to_numpy()
             c = colors[k % len(colors)]
-            ax.fill_between(w, np.clip(y - e, 0.0, None), y + e, color=c, alpha=0.2, lw=0)
+            ax.fill_between(w, y - e, y + e, color=c, alpha=0.2, lw=0)
             ax.plot(w, y, styles[k % len(styles)], lw=2, color=c, label=f'FM={fm}')
             i = int(np.argmax(y))                       # direct label at the peak
             ax.annotate(f'FM={fm}', (w[i], y[i]), xytext=(0, 6), textcoords='offset points',

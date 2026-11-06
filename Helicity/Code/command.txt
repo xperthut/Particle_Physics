@@ -85,10 +85,13 @@ python test_error.py
 
 
 # 8. One model's I(omega) for all FM on one plot -> I_omega_all_FM_{model}_no_exp.csv
-python combine_I_omega.py --model GP
+#    {model} defaults to the overall #1 of test_error_ranking_no_exp.csv (step 7);
+#    pass --model GB|RF|XGB|NN|GP to force another one
+python combine_I_omega.py
 
 
-# 9. Continuum limit a -> 0, all on the overall #1 model of train_test_error_no_exp.csv
+# 9. Continuum limit a -> 0, all on the overall #1 model of test_error_ranking_no_exp.csv
+#    (step 7 only -- step 5 / train_error.py is not needed)
 #    pointwise on the best model's I (best_model_I_no_exp_<best>.csv) -> I_omega_continuum.csv
 python continuum_extrapolation.py
 #    jackknife over Exp on I -> I_omega_continuum_jk_<best>.csv

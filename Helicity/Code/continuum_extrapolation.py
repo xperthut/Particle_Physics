@@ -2,7 +2,7 @@
 
 Reads the long-format file written by test_error.py
     Data/2026/best_model_I_no_exp_{model}.csv      (columns FM, W, I)
-with {model} the overall #1 (FM == 'all') in Data/2026/train_test_error_no_exp.csv,
+with {model} the overall #1 in Data/2026/test_error_ranking_no_exp.csv,
 where FM is the lattice spacing in units of 0.01 fm (9, 12, 15 -> a = 0.09,
 0.12, 0.15 fm).  At each fixed omega the per-a values are fit by least squares to
 

@@ -65,7 +65,7 @@ Writes
     Data/2026/M_continuum_fit_{model}.csv     per-(P, form) RMS residual, AIC, theta
     Data/2026/Images/I_omega_continuum_M_{model}.{png,pdf}
 
-The model is the overall #1 (FM == 'all') in Data/2026/train_test_error_no_exp.csv;
+The model is the overall #1 in Data/2026/test_error_ranking_no_exp.csv;
 latent draws exist only for GP, otherwise the band is configurations + fit only.
 
 Run from Helicity/Code:  python continuum_M_extrapolation.py [--n_draws 500]
@@ -82,7 +82,7 @@ import pandas as pd
 from matplotlib.ticker import MultipleLocator
 
 from jackknife import jk_error
-from test_error import MIN_P, SMOOTH_WINDOW, best_model, get_smooth_curve
+from test_error import I_PAIRS, SMOOTH_WINDOW, best_model, get_smooth_curve
 
 FM_TO_A = {9: 0.0888, 12: 0.1207, 15: 0.151}     # fm, from the rpitd file headers
 W_DECIMALS = 1
@@ -112,6 +112,20 @@ def load_replicas(data_dir, model, suffix):
         out[fm] = np.stack([cube.loc[p].reindex(exps).to_numpy() for p in P])
         print(f'FM={fm}: {len(exps)} Exp replicas, P={list(P)}, {len(W)} omega points')
     return out, grid_P, grid_W
+
+
+def load_new_M(data_dir):
+    """Same layout as ``load_replicas`` from ``new_M.csv`` (synthetic_data_generator_old.py:
+    the alpha/beta/gamma-fitted M per FM), one replica per FM (no configuration spread)."""
+    d = pd.read_csv(os.path.join(data_dir, 'new_M.csv'))
+    d['W'] = np.round(d['W'], W_DECIMALS)
+    P, W = np.sort(d.P.unique()), np.sort(d.W.unique())
+    out = {}
+    for fm in FM_TO_A:
+        cube = d[d.FM == fm].set_index(['P', 'W'])['Est_M'].unstack('W').reindex(index=P, columns=W)
+        out[fm] = cube.to_numpy()[:, None, :]
+        print(f'FM={fm}: new_M.csv (1 replica), P={list(P)}, {len(W)} omega points')
+    return out, P, W
 
 
 def load_draw_shifts(data_dir, model, suffix, P, W):
@@ -169,12 +183,13 @@ def design(form, a, unit, omega, x):
 # --------------------------------------------------------------------------- I(omega)
 
 def pair_I(M, P):
-    """I(omega) from M (..., n_P, n_W): mean of non-negative pair estimates, P >= MIN_P."""
+    """I(omega) from M (..., n_P, n_W): mean of non-negative estimates over test_error.I_PAIRS."""
     ests = []
-    for i, p1 in enumerate(P):
-        for j, p2 in enumerate(P):
-            if MIN_P <= p1 < p2:
-                ests.append((p2 ** 2 * M[..., j, :] - p1 ** 2 * M[..., i, :]) / (p2 ** 2 - p1 ** 2))
+    idx = {p: k for k, p in enumerate(P)}
+    for p1, p2 in I_PAIRS:
+        if p1 in idx and p2 in idx:
+            i, j = idx[p1], idx[p2]
+            ests.append((p2 ** 2 * M[..., j, :] - p1 ** 2 * M[..., i, :]) / (p2 ** 2 - p1 ** 2))
     E = np.stack(ests)
     E = np.where(E >= 0, E, np.nan)
     with np.errstate(invalid='ignore'):
@@ -191,9 +206,14 @@ def smooth_I(I, omega, window):
 # --------------------------------------------------------------------------- main
 
 def run(data_dir, model, n_draws, seed, window, weighting, source):
-    suffix = '_anchored' if source == 'anchored' else ''
-    reps, P, W = load_replicas(data_dir, model, suffix)
-    shifts = load_draw_shifts(data_dir, model, suffix, P, W)
+    if source == 'new_M':
+        suffix = ''
+        reps, P, W = load_new_M(data_dir)
+        shifts = None
+    else:
+        suffix = '_anchored' if source == 'anchored' else ''
+        reps, P, W = load_replicas(data_dir, model, suffix)
+        shifts = load_draw_shifts(data_dir, model, suffix, P, W)
     unit_map, reach = lattice_units(data_dir)
     fms = list(FM_TO_A)
     a = np.array([FM_TO_A[f] for f in fms])
@@ -235,15 +255,16 @@ def run(data_dir, model, n_draws, seed, window, weighting, source):
         return smooth_I(pair_I(M0, P), W, window)
 
     fits = pd.DataFrame(fit_rows)
-    # forms used for I(omega): only P >= MIN_P enter the pair relation
-    aic = fits[fits.P >= MIN_P].groupby('form').AIC.sum().reindex(FORMS)
+    # forms used for I(omega): only the P in I_PAIRS enter the pair relation
+    pair_P = {p for pr in I_PAIRS for p in pr}
+    aic = fits[fits.P.isin(pair_P)].groupby('form').AIC.sum().reindex(FORMS)
     w_aic = np.exp(-(aic - aic.min()) / 2)
     w_aic = w_aic / w_aic.sum()
     w_form = w_aic if weighting == 'aic' else pd.Series(1.0 / len(FORMS), index=FORMS)
     fits['weight'] = fits.form.map(w_form)
     print('\nRMS fit residual per P and form (spacing mismatch the form cannot absorb):')
     print(fits.pivot(index='P', columns='form', values='RMS_resid').to_string(float_format='%.2e'))
-    print(f'\nsum AIC over P>={MIN_P}:', aic.round(1).to_dict())
+    print(f'\nI pairs {I_PAIRS}; sum AIC over P in {sorted(pair_P)}:', aic.round(1).to_dict())
     print('AIC weights:', w_aic.round(4).to_dict(), f'| using {weighting} weights:',
           w_form.round(3).to_dict())
 
@@ -311,8 +332,9 @@ def plot(out, fms, a, w_form, weighting, w_real, model, band, out_base):
     for k, (fm, av) in enumerate(zip(fms, a)):
         ax.plot(w, out[f'I_FM{fm}'], STYLES[k % len(STYLES)], lw=1.2, alpha=0.8,
                 color=COLORS[k % len(COLORS)], label=f'$a={av:.3f}$ fm (FM={fm})')
-    ax.fill_between(w, out.I_lo95, out.I_hi95, color='0.2', alpha=0.12, lw=0, label=r'$\pm1.96\sigma$')
-    ax.fill_between(w, out.I_lo68, out.I_hi68, color='0.2', alpha=0.28, lw=0, label=r'$\pm1\sigma$')
+    ax.fill_between(w, out.I_lo95, out.I_hi95, color='0.2', alpha=0.12, lw=0, label='95% confidence interval')
+    ax.fill_between(w, out.I_lo68, out.I_hi68, color='0.2', alpha=0.28, lw=0,
+                    label='68% confidence interval')
     wtxt = ', '.join(f'{FORM_LABEL[f]} {w_form[f]:.2f}' for f in FORMS)
     ax.plot(w, out.I, '-', lw=2.4, color='0.05',
             label=f'continuum $a\\to0$ ({weighting} weights: {wtxt})')
@@ -349,9 +371,11 @@ if __name__ == "__main__":
                         help="how the cutoff forms are combined")
     parser.add_argument("--smooth_window", type=int, default=SMOOTH_WINDOW,
                         help="Savitzky-Golay window for I(omega), as in test_error.py")
-    parser.add_argument("--source", choices=['anchored', 'roll'], default='anchored',
+    parser.add_argument("--source", choices=['anchored', 'roll', 'new_M'], default='anchored',
                         help="anchored: reconstruct_real_data.py --anchor_real output (+ GP draws "
-                             "if present); roll: the plain seed-only roll")
+                             "if present); roll: the plain seed-only roll; new_M: the fitted "
+                             "M of synthetic_data_generator_old.py (no jackknife band)")
     args = parser.parse_args()
-    run(args.data_dir, best_model(args.data_dir), args.n_draws, args.seed, args.smooth_window, args.weights,
+    model = 'newM' if args.source == 'new_M' else best_model(args.data_dir)
+    run(args.data_dir, model, args.n_draws, args.seed, args.smooth_window, args.weights,
         args.source)

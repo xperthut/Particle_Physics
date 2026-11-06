@@ -97,7 +97,7 @@ def create_combined_data():
             )
             df.columns = ['Exp', 'Z', 'W', 'M']
             # keep only the N_OMEGA_PER_FM[fm] smallest omega values for this P
-            kept_w = np.sort(df['W'].unique())[:N_OMEGA_PER_FM[fm]]
+            kept_w = np.sort(df['W'].unique()) #[:N_OMEGA_PER_FM[fm]]
             df = df[df['W'].isin(kept_w)].copy()
             df['P'] = p
             df['FM'] = int(fm)

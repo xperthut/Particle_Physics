@@ -5,7 +5,7 @@ spacing FM in {9, 12, 15} (a = 0.0888, 0.1207, 0.151 fm):
 
   1. build I(omega) from the Exp-mean projected M with the momentum-pair
      relation of test_error.py,
-         I = (p2^2 M(p2) - p1^2 M(p1)) / (p2^2 - p1^2),  every pair 2 <= p1 < p2,
+         I = (p2^2 M(p2) - p1^2 M(p1)) / (p2^2 - p1^2),  pairs in test_error.I_PAIRS,
      averaged over the pairs and Savitzky-Golay smoothed (same window/order),
      and the same on every Exp row (each row is a jackknife sample), giving
      the per-FM jackknife error sqrt(N-1) * std (jackknife.py);
@@ -23,7 +23,7 @@ is exact.  Systematic = |I0_a2 - I0_a|.  Bands: dark = jackknife statistical,
 light = statistical (+) systematic in quadrature.  Pair estimates are not
 clipped at 0 (that would bias the jackknife); only the plotted curve is floored.
 
-The model is the overall #1 (FM == 'all') in Data/2026/train_test_error_no_exp.csv.
+The model is the overall #1 in Data/2026/test_error_ranking_no_exp.csv.
 
 Input:  Data/2026/Real_data_projected_{fm}_no_exp{suffix}_v2.csv  (P, Exp, W, M_<model>)
         --source roll (default: the plain roll) or anchored (--anchor_real output)
@@ -45,7 +45,7 @@ import pandas as pd
 from matplotlib.ticker import MultipleLocator
 
 from jackknife import jk_error
-from test_error import MIN_P, SMOOTH_WINDOW, best_model, get_smooth_curve
+from test_error import I_PAIRS, SMOOTH_WINDOW, best_model, get_smooth_curve
 
 FM_TO_A = {9: 0.0888, 12: 0.1207, 15: 0.151}     # fm, from the rpitd file headers
 W_DECIMALS = 1
@@ -64,8 +64,11 @@ def load_samples(path, model):
 
 def pair_I(M, P, W, window):
     """I(omega) per sample from M (n_P, n_samples, n_W): mean over pairs, smoothed, I(0) = 0."""
-    ests = [(p2 ** 2 * M[j] - p1 ** 2 * M[i]) / (p2 ** 2 - p1 ** 2)
-            for i, p1 in enumerate(P) for j, p2 in enumerate(P) if MIN_P <= p1 < p2]
+    idx = {p: k for k, p in enumerate(P)}
+    ests = [(p2 ** 2 * M[idx[p2]] - p1 ** 2 * M[idx[p1]]) / (p2 ** 2 - p1 ** 2)
+            for p1, p2 in I_PAIRS if p1 in idx and p2 in idx]
+    if not ests:
+        raise ValueError(f'none of the I_PAIRS {I_PAIRS} present (P = {list(P)})')
     I = np.mean(ests, axis=0)                                   # (n_samples, n_W)
     I = np.apply_along_axis(get_smooth_curve, 1, I, window)
     I[:, W == 0.0] = 0.0
@@ -126,9 +129,10 @@ def plot(out, fms, a, model, source, out_base):
         ax.plot(w, floor(out[f'I_FM{fm}']), STYLES[k % len(STYLES)], lw=1.2, alpha=0.85,
                 color=COLORS[k % len(COLORS)], label=f'$a={av:.3f}$ fm (FM={fm})')
     ax.fill_between(w, floor(out.I - out.sigma_tot), floor(out.I + out.sigma_tot),
-                    color='0.2', alpha=0.13, lw=0, label=r'stat $\oplus$ sys ($a$ vs $a^2$)')
+                    color='0.2', alpha=0.13, lw=0,
+                    label='Stat + systematic error')
     ax.fill_between(w, floor(out.I - out.sigma_stat), floor(out.I + out.sigma_stat),
-                    color='0.2', alpha=0.32, lw=0, label='stat (jackknife)')
+                    color='0.2', alpha=0.32, lw=0, label='Statistical error')
     ax.plot(w, floor(out.I), '-', lw=2.4, color='0.05',
             label=r'continuum $a\to0$: $I_0 + c\,a^{2}$')
 
