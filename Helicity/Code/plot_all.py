@@ -13,10 +13,12 @@ Figures (all written to Data/2026/Images/):
     model_selection    model_selection_FM_*
     M_curves           M_curves_<best form>
     projected_I        projected_I_no_exp_*            (top-3 models by test error)
-    best_model_I       best_model_I_no_exp_<best>
-    I_all_FM           I_omega_all_FM_<best>_no_exp
-    continuum          I_omega_continuum.{png,pdf}
+    best_model_I       best_model_I_no_exp_<model>         (--model, default RF)
+    I_all_FM           I_omega_all_FM_<model>_no_exp       (--model, default RF)
+    continuum          I_omega_continuum.{png,pdf}         (model of the last continuum_extrapolation.py run)
     continuum_jk       I_omega_continuum_jk_<model>[_anchored].{png,pdf}, one per CSV present
+                       (cutoff systematic, a vs a^2)
+    continuum_model_sys I_omega_continuum_jk_<model>_vs_<alt>[_anchored].{png,pdf} (model systematic)
     continuum_M        I_omega_continuum_M_<model>[_anchored].{png,pdf}, one per CSV present
 
 Three plotting functions also rewrite the small CSV of what they draw
@@ -27,6 +29,8 @@ Usage (works from any directory):
     python plot_all.py                          # check inputs, plot everything available
     python plot_all.py --check                  # only report which figures have their data
     python plot_all.py --only continuum_jk projected_I
+    python plot_all.py --model NN               # single-model figures for NN instead of RF
+    python plot_all.py --model ranked           # ... for the overall #1 by test error
 """
 
 import argparse
@@ -194,6 +198,8 @@ def w_anchor(fm):
 
 
 _projected_cache = {}
+PRIMARY_MODEL = 'RF'             # central model (domain scientist's choice; NN = model systematic)
+FORCE_MODEL = None               # set by --model
 
 
 def load_projected():
@@ -209,7 +215,8 @@ def load_projected():
             names = [n for n in te.MODEL_NAMES if f'Mean_M_{n}' in df_ms.columns]
             per_fm.append((fm, VARIANT, df_ms, df_I, w_anchor(fm), names,
                            real[real.FM.astype(str) == fm]))
-        _projected_cache.update(top=rank.model.head(te.TOP_K).tolist(),
+        top = rank.model.head(te.TOP_K).tolist()
+        _projected_cache.update(top=top, best=FORCE_MODEL or top[0],
                                 overall=rank.set_index('model'), per_fm=per_fm)
     c = _projected_cache
     return c['top'], c['overall'], c['per_fm']
@@ -231,12 +238,12 @@ def jobs_projected():
             tester._plot(fm, variant, df_ms, df_I, w_anc, plot_names, real_fm, overall)
 
     def best_model_I():
-        top, overall, per_fm = load_projected()
-        tester._plot_best(top[0], per_fm, overall)
+        _, overall, per_fm = load_projected()
+        tester._plot_best(_projected_cache['best'], per_fm, overall)
 
     def I_all_FM():
-        top, _, _ = load_projected()
-        best = top[0]
+        load_projected()
+        best = _projected_cache['best']
         w_real = pd.read_csv(REAL, usecols=['FM', 'W']).groupby('FM').W.max().to_dict()
         cio.plot(cio.collect(DATA_DIR, best, VARIANT), w_real, best, VARIANT,
                  os.path.join(IMG_DIR, f'I_omega_all_FM_{best}_{VARIANT}.png'))
@@ -290,6 +297,19 @@ def jobs_continuum():
         jobs.append(Job('continuum_jk', 'continuum_jk',
                         [data('I_omega_continuum_jk_<model>.csv')], lambda: None))
 
+    # model systematic (continuum_I_jackknife.py --sys_models): separate from the cutoff one
+    for path in sorted(glob.glob(data('I_omega_continuum_jk_*_vs_*.csv'))):
+        m = re.search(r'I_omega_continuum_jk_([A-Za-z]+)_vs_([A-Za-z]+)(_anchored)?\.csv$', path)
+        if not m:
+            continue
+        model, alt, suffix = m.group(1), m.group(2), m.group(3) or ''
+
+        def run(path=path, model=model, alt=alt, suffix=suffix):
+            cij.plot_model_sys(pd.read_csv(path), model, alt, 'anchored' if suffix else 'roll',
+                               os.path.join(IMG_DIR, f'I_omega_continuum_jk_{model}_vs_{alt}{suffix}'))
+        jobs.append(Job('continuum_model_sys', f'continuum_model_sys:{model}_vs_{alt}{suffix}',
+                        [path], run))
+
     # continuum on M (continuum_M_extrapolation.py): one figure per CSV present
     mc = sorted(glob.glob(data('I_omega_continuum_M_*.csv')))
     for path in mc:
@@ -321,7 +341,8 @@ def jobs_continuum():
 # --------------------------------------------------------------------------- driver
 
 GROUPS = ['real_diagnostics', 'real_M_jk_by_FM', 'real_vs_synthetic', 'I_estimated', 'model_selection', 'M_curves',
-          'projected_I', 'best_model_I', 'I_all_FM', 'continuum', 'continuum_jk', 'continuum_M']
+          'projected_I', 'best_model_I', 'I_all_FM', 'continuum', 'continuum_jk',
+          'continuum_model_sys', 'continuum_M']
 
 
 def main():
@@ -330,7 +351,12 @@ def main():
                         help='only check that every figure has its input data; plot nothing')
     parser.add_argument('--only', nargs='+', choices=GROUPS, metavar='GROUP',
                         help=f'plot only these groups: {", ".join(GROUPS)}')
+    parser.add_argument('--model', choices=te.MODEL_NAMES + ['ranked'], default=PRIMARY_MODEL,
+                        help=f'model for best_model_I / I_all_FM (default {PRIMARY_MODEL}, the '
+                             f'primary model; "ranked" = overall #1 by test error)')
     args = parser.parse_args()
+    global FORCE_MODEL
+    FORCE_MODEL = None if args.model == 'ranked' else args.model
 
     jobs = jobs_synthetic() + jobs_model_selection() + jobs_projected() + jobs_continuum()
     if args.only:

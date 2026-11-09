@@ -375,7 +375,9 @@ if __name__ == "__main__":
                         help="anchored: reconstruct_real_data.py --anchor_real output (+ GP draws "
                              "if present); roll: the plain seed-only roll; new_M: the fitted "
                              "M of synthetic_data_generator_old.py (no jackknife band)")
+    parser.add_argument("--model", choices=['GB', 'RF', 'XGB', 'NN', 'GP'], default=None,
+                        help="Model (default: overall #1 in test_error_ranking_no_exp.csv)")
     args = parser.parse_args()
-    model = 'newM' if args.source == 'new_M' else best_model(args.data_dir)
+    model = 'newM' if args.source == 'new_M' else best_model(args.data_dir, model=args.model)
     run(args.data_dir, model, args.n_draws, args.seed, args.smooth_window, args.weights,
         args.source)

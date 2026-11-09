@@ -128,6 +128,11 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", default='../Data/2026',
                         help="Where to read best_model_I_no_exp_<model>.csv and write "
                              "I_omega_continuum.csv and Images/")
+    parser.add_argument("--model", choices=['GB', 'RF', 'XGB', 'NN', 'GP'], default=None,
+                        help="Model (default: overall #1 in test_error_ranking_no_exp.csv)")
     args = parser.parse_args()
-    src = os.path.join(args.data_dir, f'best_model_I_no_exp_{best_model(args.data_dir)}.csv')
+    model = best_model(args.data_dir, model=args.model)
+    src = os.path.join(args.data_dir, f'best_model_I_no_exp_{model}.csv')
+    if not os.path.exists(src):
+        raise SystemExit(f'{src} not found -- run test_error.py --model {model} first')
     main(src, args.data_dir)

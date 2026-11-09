@@ -80,8 +80,8 @@ python reconstruct_real_data.py --anchor_real --n_draws 200 --models GP
 #    -> Projected_M_mean_err_no_exp_{fm}.csv (Exp mean +- jackknife error),
 #       Projected_I_no_exp_{fm}.csv, test_error_summary_no_exp.csv,
 #       test_error_ranking_no_exp.csv, train_test_error_no_exp.csv,
-#       best_model_I_no_exp_{model}.csv
-python test_error.py
+#       best_model_I_no_exp_{model}.csv  ({model}: --model, default overall #1)
+python test_error.py --model RF
 
 
 # 8. One model's I(omega) for all FM on one plot -> I_omega_all_FM_{model}_no_exp.csv
@@ -94,8 +94,11 @@ python combine_I_omega.py
 #    (step 7 only -- step 5 / train_error.py is not needed)
 #    pointwise on the best model's I (best_model_I_no_exp_<best>.csv) -> I_omega_continuum.csv
 python continuum_extrapolation.py
-#    jackknife over Exp on I -> I_omega_continuum_jk_<best>.csv
-python continuum_I_jackknife.py --source roll
+#    jackknife over Exp on I -> I_omega_continuum_jk_<model>.csv  (--model, default overall #1)
+#    RF = central value (domain choice); cutoff systematic a vs a^2 -> I_omega_continuum_jk_RF.*
+#    --sys_models NN additionally writes the model systematic |I0_RF - I0_NN|,
+#    separately -> I_omega_continuum_jk_RF_vs_NN.*
+python continuum_I_jackknife.py --source roll --model RF --sys_models NN
 #    on M first, then I, jackknife stat + fit/model/form errors (anchored needs the
 #    --anchor_real run of step 6) -> I_omega_continuum_M_<best>_anchored.csv
 python continuum_M_extrapolation.py --source anchored --n_draws 500

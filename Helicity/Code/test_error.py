@@ -87,12 +87,15 @@ VARIANT = 'no_exp'
 _FILE_RE = re.compile(r'Real_data_projected_(.+)_(no_exp|with_exp)_v2\.csv$')
 
 
-def best_model(data_dir, variant=VARIANT):
-    """Overall #1 model in test_error_ranking_{variant}.csv, written by this script.
+def best_model(data_dir, variant=VARIANT, model=None):
+    """``model`` if given (``--model``), else the overall #1 in test_error_ranking_{variant}.csv.
 
     Same ranking run() uses to pick the model for best_model_I_{variant}_{model}.csv,
     so it needs only test_error.py (not train_error.py).
     """
+    if model is not None:
+        print(f'model: {model} (set by --model)')
+        return model
     path = os.path.join(data_dir, f'test_error_ranking_{variant}.csv')
     if not os.path.exists(path):
         raise FileNotFoundError(f'{path} not found -- run test_error.py first')
@@ -126,7 +129,9 @@ def get_mean_err(data, grp_cols, agg_col):
 
 
 class Test_Error:
-    def __init__(self, data_dir='../Data/2026', smooth_window=SMOOTH_WINDOW, top_k=TOP_K):
+    def __init__(self, data_dir='../Data/2026', smooth_window=SMOOTH_WINDOW, top_k=TOP_K,
+                 model=None):
+        self.model = model          # forced model for best_model_I_*; None = ranking #1
         self.data_dir = data_dir
         self.top_k = top_k
         self.smooth_window = smooth_window
@@ -288,9 +293,6 @@ class Test_Error:
             c = colors[k % len(colors)]
             ax.fill_between(w, y - e, y + e, color=c, alpha=0.2, lw=0)
             ax.plot(w, y, styles[k % len(styles)], lw=2, color=c, label=f'FM={fm}')
-            i = int(np.argmax(y))                       # direct label at the peak
-            ax.annotate(f'FM={fm}', (w[i], y[i]), xytext=(0, 6), textcoords='offset points',
-                        ha='center', va='bottom', fontsize=9, color='0.2')
             w_anchor = max(w_anchor, w_anc)
             curves.append(pd.DataFrame({'FM': fm, 'W': w, 'I': y, 'Err': e}))
         if curves:
@@ -305,10 +307,29 @@ class Test_Error:
         ax.set_xlabel(r'$\omega$')
         ax.set_ylabel(r'$\Delta\mathcal{I}_g(\omega)$')
         o = overall.loc[best]
-        ax.set_title(f'{MODEL_TITLES[best]} (best mean test error: RMSE={o.mean_RMSE:.4f}, '
+        rank = int(o.overall_rank) if 'overall_rank' in o else None
+        what = 'best mean test error' if rank in (None, 1) else f'rank {rank} by mean test error'
+        ax.set_title(f'{MODEL_TITLES[best]} ({what}: RMSE={o.mean_RMSE:.4f}, '
                      f'$R^2$={o.mean_R2:.3f})\n'
                      f'smoothed I($\\omega$), {VARIANT_TITLE[VARIANT]}', fontsize=10)
         ax.legend(frameon=False)
+        # direct FM labels at the right end (omega ~18.5), where the curves overlap
+        # less than at the peak; pushed apart vertically so they never collide
+        if curves:
+            lo, hi = ax.get_ylim()
+            gap = 0.06 * (hi - lo)
+            labs = []
+            for k, cdf in enumerate(curves):
+                w_c, y_c = cdf.W.to_numpy(), cdf.I.to_numpy()
+                x_lab = min(18.5, w_c.max())
+                labs.append([float(np.interp(x_lab, w_c, y_c)), x_lab, cdf.FM.iloc[0],
+                             colors[k % len(colors)]])
+            labs.sort(key=lambda t: t[0])
+            for j in range(1, len(labs)):
+                labs[j][0] = max(labs[j][0], labs[j - 1][0] + gap)
+            for y_l, x_l, fm, c in labs:
+                ax.text(x_l, y_l + 0.5 * gap, f'FM={fm}', ha='center', va='bottom',
+                        fontsize=9, color=c)
         fig.tight_layout()
         out_png = os.path.join(self.img_dir, f'best_model_I_{VARIANT}_{best}.png')
         fig.savefig(out_png, dpi=330)
@@ -498,7 +519,11 @@ class Test_Error:
             plot_names = [n for n in top if n in names] if top else names
             self._plot(fm, variant, df_ms, df_I, w_anchor, plot_names, real_fm, overall)
         if top:
-            self._plot_best(top[0], per_fm, overall)
+            chosen = self.model or top[0]
+            if chosen not in overall.index:
+                raise SystemExit(f'--model {chosen}: not in the projected files '
+                                 f'(available: {list(overall.index)})')
+            self._plot_best(chosen, per_fm, overall)
 
 
 if __name__ == "__main__":
@@ -510,6 +535,9 @@ if __name__ == "__main__":
     parser.add_argument("--top_k", type=int, default=TOP_K,
                         help="Number of best-ranked models plotted in projected_I_*.png "
                              f"(default {TOP_K}; {len(MODEL_NAMES)} = all)")
+    parser.add_argument("--model", choices=MODEL_NAMES, default=None,
+                        help="Model for best_model_I_*.{csv,png} (default: overall #1 by test error)")
     args = parser.parse_args()
 
-    Test_Error(data_dir=args.data_dir, smooth_window=args.smooth_window, top_k=args.top_k).run()
+    Test_Error(data_dir=args.data_dir, smooth_window=args.smooth_window, top_k=args.top_k,
+               model=args.model).run()
