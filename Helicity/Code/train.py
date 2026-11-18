@@ -9,7 +9,7 @@ import re
 
 # with_exp_id -> the train-CSV name fragment written by prepare_train_test_data.py
 FILE_SUFFIX = {'Yes': 'with_exp', 'No': 'without_exp'}
-MODEL_TYPES = ['GB', 'RF', 'XGB', 'NN', 'GP']
+MODEL_TYPES = ['GB', 'RF', 'XGB', 'NN', 'GP', 'BNN', 'NNE']
 
 
 class Train:
@@ -28,6 +28,10 @@ class Train:
             return self.model.NeuralNetworkModel(df_train, 1, n_iter, **search_kwargs)
         elif self.name == 'GP':
             return self.model.GaussianProcessModel(df_train, 1, n_iter, **search_kwargs)
+        elif self.name == 'BNN':
+            return self.model.BayesianNNModel(df_train, 1, n_iter, **search_kwargs)
+        elif self.name == 'NNE':
+            return self.model.NNEnsembleModel(df_train, 1, n_iter, **search_kwargs)
 
     def train_model(self, df_train, fm, with_exp_id, model_dir, n_iter, search_kwargs):
         save_name = f"{self.name}_exp_{with_exp_id}"
@@ -63,7 +67,8 @@ if __name__ == "__main__":
                          help="Ensemble id (e.g. '9', '12', '15'), or 'all' to train every FM found in --data_dir.")
     parser.add_argument("--model_type", type=str, required=True,
                          help="GB for Gradient boosted, RF for Random forest, XGB for Extreme gradient boosted, "
-                              "NN for a neural network (MLP), and GP for a Gaussian process.")
+                              "NN for a neural network (MLP), GP for a Gaussian process, and BNN for a "
+                              "Bayesian neural network sampled with HMC.")
     parser.add_argument("--with_exp_id", type=str, required=False, default="No",
                          help="'Yes' trains on Synthetic_train_data_with_exp_{fm}.csv, 'No' on the without_exp variant.")
     parser.add_argument("--data_dir", type=str, required=False, default="../Data/2026",
@@ -82,6 +87,30 @@ if __name__ == "__main__":
                          help="GP only: rows per P the Gaussian process is fit on (exact GP cost grows "
                               "as n^3, so it is never fit on the full per-P data).")
 
+    # BNN only (bnn.py / model.DEFAULT_BNN_PARAMS)
+    parser.add_argument("--bnn_width", type=int, default=32,
+                        help="BNN: first hidden layer width (layers halve, like NN)")
+    parser.add_argument("--bnn_depth", type=int, default=2, help="BNN: number of hidden layers")
+    parser.add_argument("--bnn_max_samples", type=int, default=3000,
+                        help="BNN: rows per P the posterior is sampled on (full-batch HMC)")
+    parser.add_argument("--hmc_chains", type=int, default=2, help="BNN: HMC chains per P")
+    parser.add_argument("--hmc_warmup", type=int, default=600,
+                        help="BNN: warmup iterations per chain (step size + mass matrix tuning)")
+    parser.add_argument("--hmc_samples", type=int, default=600,
+                        help="BNN: sampling iterations per chain")
+    parser.add_argument("--hmc_leapfrog", type=int, default=30,
+                        help="BNN: leapfrog steps per HMC iteration")
+    parser.add_argument("--hmc_keep", type=int, default=200,
+                        help="BNN: posterior draws kept in the saved model (over all chains)")
+
+    # NNE only (model.NNEnsembleRegressor): bootstrap ensemble of small MLPs
+    parser.add_argument("--nne_members", type=int, default=16, help="NNE: ensemble members per P")
+    parser.add_argument("--nne_width", type=int, default=8, help="NNE: first hidden layer width")
+    parser.add_argument("--nne_depth", type=int, default=1, help="NNE: number of hidden layers")
+    parser.add_argument("--nne_alpha", type=float, default=1e-3, help="NNE: L2 penalty")
+    parser.add_argument("--nne_rows", type=int, default=50000,
+                        help="NNE: max rows per member after the replica bootstrap")
+
     args = parser.parse_args()
 
     if args.model_type not in MODEL_TYPES:
@@ -96,6 +125,15 @@ if __name__ == "__main__":
 
         if args.model_type == 'GP':
             search_kwargs = {'gp_max_samples': args.gp_max_samples}
+        elif args.model_type == 'BNN':
+            search_kwargs = {'width': args.bnn_width, 'depth': args.bnn_depth,
+                             'max_samples': args.bnn_max_samples, 'n_chains': args.hmc_chains,
+                             'n_warmup': args.hmc_warmup, 'n_samples': args.hmc_samples,
+                             'n_leapfrog': args.hmc_leapfrog, 'n_keep': args.hmc_keep}
+        elif args.model_type == 'NNE':
+            search_kwargs = {'n_members': args.nne_members, 'width': args.nne_width,
+                             'depth': args.nne_depth, 'alpha': args.nne_alpha,
+                             'n_rows': args.nne_rows}
         else:
             search_kwargs = {'cv_splits': args.cv_splits, 'search_sample_size': args.search_sample_size}
 

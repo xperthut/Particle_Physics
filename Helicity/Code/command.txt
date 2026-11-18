@@ -2,24 +2,28 @@
 # Run from Helicity/Code. Each step reads the CSVs written by the steps before it.
 # Use the qsar env (the saved models were pickled with sklearn 1.8), e.g.
 #   ~/miniconda3/envs/qsar/bin/python train.py ...
+#
+# Data/2026 keeps only the raw inputs: All_p_w_m.csv, ITD-pol-fit1-line.txt, rpitd/.
+# Everything else (data + Images) is regenerated WITHOUT retraining by
+#   bash run_2026_data.sh             (steps 2-3 and 5-10 below; log -> Data/2026/run_2026_data.log)
+#   FROM=4 bash run_2026_data.sh      (resume at the script's step 4 = roll)
+# It uses the models already in model/2026; step 4 (training) is NOT run.
 
 
-# 1. Model selection for M(omega, P) on the real data (All_p_w_m.csv)
-#    -> model_selection_fits.csv / _summary.csv / _rmse_per_P.csv / _bootstrap.csv
-#    then the best model's curves on omega = 0..20 -> M_curves_<best>.csv, where <best>
-#    has the highest bootstrap QAICc win fraction (ties: lowest summed QAICc)
-#    (--n_boot 0 skips the Exp bootstrap; <best> then = lowest summed QAICc)
-python model_selection.py --n_boot 200
-python model_selection.py --curves
+# 1. (dropped 2026-11-03) model_selection.py's M(omega, P) fit forms are no longer used.
 
 
-# 2. Synthetic data: M at P=3 from M_curves_<best>.csv, M1..M5 and I from estimate_M_values,
-#    then Exp replicas around them. Builds All_p_w_m.csv from rpitd/*.txt only if missing.
-#    -> new_M.csv, I_omega_estimated.csv, loss_val_FM_{fm}.csv, M_real_vs_est_FM_{fm}.csv,
-#       new_M_S.csv, generated_Synthetic_exp_data.csv
-#    also real-data diagnostics: mean_median_and_qq.png, Mean_vs_W_FM_*.png, Std_vs_W_FM_*.png,
-#    linearity_check.csv  (--diagnostics_only writes just these, no synthetic data)
-python synthetic_data_generator.py
+# 2. Synthetic data (synthetic_data_generator_abg.py): M(omega, P) derived from the ITD line
+#    (ITD-pol-fit1-line.txt) with pair consistency, alpha/beta/gamma fitted per FM to the
+#    real mean M, then Exp replicas ~ Normal(Est_M, Est_S) (seed 12345).
+#    Builds All_p_w_m.csv from rpitd/*.txt only if missing.
+#    -> new_M.csv, optimal_alpha_beta.csv, loss_val_FM_{fm}.csv, M_real_vs_est_FM_{fm}.csv,
+#       new_M_S.csv, generated_Synthetic_exp_data.csv, real-data diagnostics
+#       (mean_median_and_qq.png, Mean_vs_W_FM_*.png, Std_vs_W_FM_*.png, linearity_check.csv)
+#    --no_smooth: raw i.i.d. replicas. The model/2026 models were trained on these
+#    (Nov 5-11), so use it to stay consistent with them; without it each replica is
+#    Savitzky-Golay smoothed along omega (the current default, models NOT retrained on it).
+python synthetic_data_generator_abg.py --no_smooth
 
 
 # 3. Sliding-window train frames, per FM
@@ -33,12 +37,14 @@ python train.py --fm all --with_exp_id 'No' --model_type 'XGB'
 python train.py --fm all --with_exp_id 'No' --model_type 'RF'
 python train.py --fm all --with_exp_id 'No' --model_type 'NN'
 python train.py --fm all --with_exp_id 'No' --model_type 'GP'
+python train.py --fm all --with_exp_id 'No' --model_type 'BNN'
 
 python train.py --fm all --with_exp_id 'Yes' --model_type 'GB'
 python train.py --fm all --with_exp_id 'Yes' --model_type 'XGB'
 python train.py --fm all --with_exp_id 'Yes' --model_type 'RF'
 python train.py --fm all --with_exp_id 'Yes' --model_type 'NN'
 python train.py --fm all --with_exp_id 'Yes' --model_type 'GP'
+python train.py --fm all --with_exp_id 'Yes' --model_type 'BNN'
 
 # Single ensemble, e.g. FM 9 only:
 #   python train.py --fm 9 --with_exp_id 'Yes' --model_type 'XGB'
@@ -60,7 +66,17 @@ python train.py --fm all --with_exp_id 'Yes' --model_type 'GP'
 # maximum likelihood on --gp_max_samples rows per P (default 2000; cost ~ n^3):
 #   python train.py --fm 9 --with_exp_id 'No' --model_type 'GP' --gp_max_samples 3000
 #
-# Steps 5-7 use whichever of GB, RF, XGB, NN, GP have a saved .sav and skip the rest.
+# BNN (bnn.py) = Bayesian MLP, tanh, weights sampled with HMC (pure torch): per P,
+# --hmc_chains chains, each from its own MAP fit; --hmc_warmup iterations tune the
+# step size (dual averaging) and diagonal mass matrix, then --hmc_samples iterations of
+# --hmc_leapfrog steps, thinned to --hmc_keep draws saved in the .sav. Full-batch HMC,
+# so like GP it is fit on --bnn_max_samples rows per P (default 3000; ~1.5 min per P).
+# Its _best_params.json holds the sampler diagnostics (acceptance, divergences, R-hat of
+# the predictions across chains). predict() = posterior-mean prediction, so the roll
+# stays deterministic; the draws themselves are in est.predict_samples(X).
+#   python train.py --fm 9 --with_exp_id 'No' --model_type 'BNN' --hmc_warmup 1000 --hmc_samples 1000
+#
+# Steps 5-7 use whichever of GB, RF, XGB, NN, GP, BNN have a saved .sav and skip the rest.
 
 
 # 5. Training error (RMSE / R2 per FM, model, variant) -> printed
@@ -75,25 +91,42 @@ python reconstruct_real_data.py --exp_id Yes
 #    -> Real_data_projected_{fm}_no_exp_anchored_v2.csv, ..._anchored_draws_v2.csv
 python reconstruct_real_data.py --anchor_real --n_draws 200 --models GP
 
+# (experiment, other folder) noise on the seed M values
+#   python reconstruct_real_data.py --data_dir '../Data/2026_fresh' --model_dir '../model/2026_fresh' --seed_noise 20.0
 
 # 7. M -> I(omega) per FM, test error vs real data, model ranking
-#    -> Projected_M_mean_err_no_exp_{fm}.csv (Exp mean +- jackknife error),
-#       Projected_I_no_exp_{fm}.csv, test_error_summary_no_exp.csv,
-#       test_error_ranking_no_exp.csv, train_test_error_no_exp.csv,
-#       best_model_I_no_exp_{model}.csv  ({model}: --model, default overall #1)
-python test_error.py --model RF
+#    --variant picks which step-6 projections are scored: no_exp (default, *_exp_No
+#    models), with_exp (*_exp_Yes models) or both (no_exp, then with_exp).
+#    -> Projected_M_mean_err_{variant}_{fm}.csv (Exp mean +- jackknife error),
+#       Projected_I_{variant}_{fm}.csv, test_error_summary_{variant}.csv,
+#       test_error_ranking_{variant}.csv, train_test_error_{variant}.csv,
+#       best_model_I_{variant}_{model}.csv  ({model}: --model, default overall #1)
+#    Plots: Images/projected_I_{variant}_{fm}.png = top 3 by test error, or exactly the
+#    --selectmodel models (e.g. --selectmodel NN RF); Images/projected_I_{variant}_{fm}_all.png
+#    = every model, always written.
+#    Steps 8-9 read only the no_exp outputs.
+#    both variants, only RF and NN in projected_I_{variant}_{fm}.png (what run_2026_data.sh does):
+python test_error.py --model RF --variant both --selectmodel RF NN
+#    one variant at a time / top 3 by test error instead:
+#   python test_error.py --model RF
+#   python test_error.py --model RF --variant with_exp
 
+# (experiment, other folder) test error on noisy seeds
+#   python test_error.py --model RF --variant both --ylim_I -0.02 0.07 --selectmodel RF NN BNN --data_dir '../Data/2026_fresh/seednoise_10'
 
 # 8. One model's I(omega) for all FM on one plot -> I_omega_all_FM_{model}_no_exp.csv
 #    {model} defaults to the overall #1 of test_error_ranking_no_exp.csv (step 7);
-#    pass --model GB|RF|XGB|NN|GP to force another one
+#    pass --model GB|RF|XGB|NN|GP|BNN to force another one
 python combine_I_omega.py
+python combine_I_omega.py --model RF
+python combine_I_omega.py --model NN
 
 
 # 9. Continuum limit a -> 0, all on the overall #1 model of test_error_ranking_no_exp.csv
 #    (step 7 only -- step 5 / train_error.py is not needed)
 #    pointwise on the best model's I (best_model_I_no_exp_<best>.csv) -> I_omega_continuum.csv
-python continuum_extrapolation.py
+#    --model RF: step 7 (test_error.py --model RF) writes best_model_I only for RF
+python continuum_extrapolation.py --model RF
 #    jackknife over Exp on I -> I_omega_continuum_jk_<model>.csv  (--model, default overall #1)
 #    RF = central value (domain choice); cutoff systematic a vs a^2 -> I_omega_continuum_jk_RF.*
 #    --sys_models NN additionally writes the model systematic |I0_RF - I0_NN|,
@@ -101,4 +134,17 @@ python continuum_extrapolation.py
 python continuum_I_jackknife.py --source roll --model RF --sys_models NN
 #    on M first, then I, jackknife stat + fit/model/form errors (anchored needs the
 #    --anchor_real run of step 6) -> I_omega_continuum_M_<best>_anchored.csv
-python continuum_M_extrapolation.py --source anchored --n_draws 500
+#    --model GP: the anchored roll (step 6, --models GP) holds only M_GP
+python continuum_M_extrapolation.py --source anchored --n_draws 500 --model GP
+
+
+# 10. Redraw every figure in Data/2026/Images from the CSVs on disk (no refit)
+python plot_all.py
+
+
+# Final_draft experiment (Helicity/Final_draft, own folders Data/Final_draft, model/Final_draft):
+# Nov 5 non-smooth RF/NN/XGB models, RF vs NN, NN replica band. Run from Helicity/Final_draft:
+#   bash run_final.sh                 # copy inputs/models, train/test error, roll, plots, continuum
+#   python nn_replica.py              # NN replica band (R = 100, dnn_fit replica method)
+#   python nn_replica_continuum.py    # NN continuum with the replica band
+#   python plot_all.py                # redraw every Final_draft figure

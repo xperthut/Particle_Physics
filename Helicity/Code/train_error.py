@@ -31,7 +31,7 @@ pd.options.mode.chained_assignment = None
 
 # with_exp_id -> the train-CSV name fragment written by prepare_train_test_data.py
 FILE_SUFFIX = {'Yes': 'with_exp', 'No': 'without_exp'}
-MODEL_TYPES = ['GB', 'RF', 'XGB', 'NN', 'GP']
+MODEL_TYPES = ['GB', 'RF', 'XGB', 'NN', 'GP', 'BNN', 'NNE']
 
 
 def discover_fms(data_dir, with_exp_id):

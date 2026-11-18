@@ -101,6 +101,12 @@ def per_fm_I(data_dir, model, suffix, fms, window):
         I_fm.append(pair_I(np.nanmean(M, axis=1, keepdims=True), P, W, window)[0])
         s_fm.append(jk_error(pair_I(M, P, W, window), axis=0))
         print(f'[{model}] FM={fm}: {M.shape[1]} configurations (jackknife), P={list(P)}')
+
+        cum_sum = True
+        if cum_sum and model != 'RF':
+            #print(model)
+            s_fm[-1] = np.sqrt(np.cumsum(s_fm[-1] ** 2))
+
     return W, np.stack(I_fm), np.stack(s_fm)                    # (n_FM, n_W)
 
 

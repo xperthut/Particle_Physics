@@ -14,6 +14,9 @@ import time
 import warnings
 warnings.filterwarnings("ignore")
 
+from bnn import BayesianMLPRegressor
+from nne import NNEnsembleRegressor
+
 # Bayesian-optimization iteration budget shared by every model's BayesSearchCV
 # unless a caller overrides it per call.
 DEFAULT_N_ITER = 20
@@ -32,6 +35,10 @@ DEFAULT_SEARCH_SAMPLE_SIZE = 20000
 # and O(n^2) in memory, so unlike the other models it cannot be refit on the
 # full (~200k-row) per-P frame; it is fit on a seeded random subsample instead.
 DEFAULT_GP_MAX_SAMPLES = 2000
+# Bayesian NN (HMC, bnn.py): full-batch gradients at every leapfrog step, so it
+# is fit on a seeded subsample per P, like the GP.
+DEFAULT_BNN_PARAMS = dict(width=32, depth=2, max_samples=3000, n_chains=2,
+                          n_warmup=600, n_samples=600, n_leapfrog=30, n_keep=200)
 
 
 class ChunkedGaussianProcessRegressor(GaussianProcessRegressor):
@@ -375,5 +382,76 @@ class Model:
             if verbose > 0:
                 print(best_params[int(p)])
                 print('[P={}] GP fit on {} rows in {:.0f}s'.format(p, len(X), time.time() - start))
+
+        return model, best_params
+
+    def NNEnsembleModel(self, df_train, verbose=0, n_iter=DEFAULT_N_ITER, **nne_kwargs):
+        """Per-P bootstrap ensemble of small MLPs (NNEnsembleRegressor).
+
+        No search: the architecture is fixed small on purpose (nne_kwargs /
+        train.py --nne_* flags).  Replicas are identified from the frame's row
+        order (P -> Exp -> W): a new replica starts wherever w5 drops.
+        """
+        model = []
+        best_params = {}
+        if verbose > 0:
+            print('////////////////////////////////////////////// NN bootstrap ensemble ////////////////////////////////')
+
+        for p in sorted(df_train.P.unique()):
+            tmp = df_train.loc[df_train.P == p].reset_index(drop=True)
+            X = tmp.iloc[:, :-1]
+            Y = tmp.iloc[:, -1:].values.ravel()
+            rid = (tmp['Exp'].to_numpy() if 'Exp' in tmp.columns
+                   else np.cumsum(np.r_[0, np.diff(tmp['w5'].to_numpy()) < 0]))
+
+            start = time.time()
+            est = NNEnsembleRegressor(random_state=int(p), verbose=verbose,
+                                      **nne_kwargs).fit(X, Y, replica_id=rid)
+            all_pred = est.predict_all(X.iloc[::max(1, len(X) // 20000)])
+            best_params[int(p)] = {**est.get_params(),
+                                   'device': est.device_, 'n_epochs': est.n_epochs_,
+                                   'val_rmse_median': float(np.sqrt(np.median(est.val_mse_))),
+                                   'n_replicas': int(len(np.unique(rid))),
+                                   'member_spread_median': float(np.median(all_pred.std(axis=0))),
+                                   'fit_seconds': round(time.time() - start, 1)}
+            model.append(est)
+            if verbose > 0:
+                print(f'[P={p}] NNE {best_params[int(p)]}', flush=True)
+
+        return model, best_params
+
+    def BayesianNNModel(self, df_train, verbose=0, n_iter=DEFAULT_N_ITER, **bnn_kwargs):
+        """Per-P Bayesian MLP whose weights are sampled with HMC (bnn.py).
+
+        No BayesSearchCV: the posterior over weights replaces the point fit, and
+        the architecture / sampler settings come from ``bnn_kwargs`` (train.py
+        --bnn_* / --hmc_* flags, defaults DEFAULT_BNN_PARAMS).  n_iter is
+        accepted only so train.py can call every model the same way.  The JSON
+        "best params" hold the sampler diagnostics (step size, acceptance,
+        divergences, R-hat of the predictions across chains).
+        """
+        model = []
+        best_params = {}
+        params = {**DEFAULT_BNN_PARAMS, **bnn_kwargs}
+
+        if verbose > 0:
+            print('////////////////////////////////////////////// Bayesian NN (HMC) regressor ////////////////////////////////')
+
+        for p in sorted(df_train.P.unique()):
+            tmp = df_train.loc[df_train.P == p]
+            X = tmp.iloc[:, :-1]
+            Y = tmp.iloc[:, -1:].values.ravel()
+
+            start = time.time()
+            est = BayesianMLPRegressor(random_state=int(p), verbose=verbose, **params).fit(X, Y)
+            best_params[int(p)] = {**params, **est.diagnostics_}
+            model.append(est)
+
+            if verbose > 0:
+                d = est.diagnostics_
+                print('[P={}] BNN {} on {} rows: R-hat(pred) median={:.3f} max={:.3f}, '
+                      'noise sigma={:.2e}, {:.0f}s'.format(
+                          p, d['hidden'], d['n_fit_rows'], d['rhat_pred_median'],
+                          d['rhat_pred_max'], d['noise_sigma_mean'], time.time() - start))
 
         return model, best_params

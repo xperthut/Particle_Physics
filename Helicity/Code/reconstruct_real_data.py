@@ -62,6 +62,7 @@ Run from ``Helicity/Code`` (paths are relative):
 
 import argparse
 import os
+import shutil
 
 import joblib
 import numpy as np
@@ -77,7 +78,7 @@ pd.options.mode.chained_assignment = None
 # extra Exp column; *_exp_No models do not.
 _LAGS = ['w1', 'm1', 'w2', 'm2', 'w3', 'm3', 'w4', 'm4', 'w5']
 FEATURES = {'No': ['P'] + _LAGS, 'Yes': ['P', 'Exp'] + _LAGS}
-MODEL_NAMES = ['GB', 'RF', 'XGB', 'NN', 'GP']
+MODEL_NAMES = ['GB', 'RF', 'XGB', 'NN', 'GP', 'BNN', 'NNE']
 N_LAGS = 4          # number of (w, m) lag points feeding each prediction
 W_DECIMALS = 1      # omega grid is compared after rounding to this many decimals
 
@@ -144,10 +145,126 @@ class GPDrawRoller:
         return mu + delta
 
 
+class GPReplicaSampler:
+    """Per-replica latent-GP sampling inside the Exp roll (--propagate).
+
+    Each row (replica) gets its own latent error at every step, drawn from the
+    posterior conditional on that row's previous-step error (bivariate
+    Gaussian of the current and previous inputs, Markov approximation), so the
+    model uncertainty accumulates along omega independently per replica.
+    Only the diagonal / row-wise cross covariances are computed, so this scales
+    to all ~1900 replicas.  Assumes kernel = Constant * RBF + White.
+    """
+
+    def __init__(self, pipe, rng):
+        self.scale = pipe.named_steps['scale']
+        gp = pipe.named_steps['gp']
+        k = gp.kernel_
+        if not (hasattr(k, 'k1') and hasattr(k.k1, 'k1') and hasattr(k.k1.k2, 'length_scale')):
+            raise ValueError(f'GPReplicaSampler: unexpected kernel {k}')
+        self.gp = gp
+        self.latent = k.k1                          # Constant * RBF (white noise excluded)
+        self.amp = float(k.k1.k1.constant_value)
+        self.ls = np.asarray(k.k1.k2.length_scale, dtype=float)
+        self.y_std = float(np.atleast_1d(getattr(gp, '_y_train_std', 1.0))[0])
+        self.y_mean = float(np.atleast_1d(getattr(gp, '_y_train_mean', 0.0))[0])
+        self.rng = rng
+        self.prev_Xs, self.prev_V, self.prev_delta = None, None, None
+
+    def _moments(self, Xs):
+        """Mean (orig. units), latent var (normalised units), V = L^-1 k_*."""
+        from scipy.linalg import solve_triangular
+        K_trans = self.latent(Xs, self.gp.X_train_)   # white term is 0 off the training points
+        mu = K_trans @ self.gp.alpha_
+        V = solve_triangular(self.gp.L_, K_trans.T, lower=True, check_finite=False)
+        var = np.clip(self.latent.diag(Xs) - np.einsum('ij,ij->j', V, V), 0.0, None)
+        return np.ravel(mu) * self.y_std + self.y_mean, var, V
+
+    def step(self, X):
+        Xs = self.scale.transform(np.asarray(X, dtype=float))
+        mu, var, V = self._moments(Xs)
+        z = self.rng.standard_normal(len(Xs))
+        if self.prev_Xs is None:
+            delta = np.sqrt(var) * z
+        else:
+            v_prev = np.clip(self.prev_var, 1e-30, None)
+            k_pc = self.amp * np.exp(-0.5 * np.sum(((self.prev_Xs - Xs) / self.ls) ** 2, axis=1))
+            c = k_pc - np.einsum('ij,ij->j', self.prev_V, V)
+            cond_var = np.clip(var - c ** 2 / v_prev, 0.0, None)
+            delta = c / v_prev * self.prev_delta + np.sqrt(cond_var) * z
+        self.prev_Xs, self.prev_V, self.prev_var, self.prev_delta = Xs, V, var, delta
+        return mu + delta * self.y_std
+
+
+class BNNReplicaSampler:
+    """Per-replica BNN posterior draw (--propagate): replica i uses one fixed
+    HMC weight sample for its whole roll, i.e. a joint posterior function draw."""
+
+    def __init__(self, est, n_rows, rng):
+        self.est = est
+        n_d = len(est.samples_)
+        self.draw = np.resize(rng.permutation(n_d), n_rows)
+
+    def step(self, X):
+        Xs = (np.asarray(X, dtype=float) - self.est.x_mean_) / self.est.x_scale_
+        out = np.empty(len(Xs))
+        for d in np.unique(self.draw):
+            rows = np.flatnonzero(self.draw == d)
+            out[rows] = self.est._f_std(self.est.samples_[d:d + 1], Xs[rows])[0]
+        return out * self.est.y_scale_ + self.est.y_mean_
+
+
+class EnsembleReplicaSampler:
+    """Per-replica NNE member (--propagate NNE): replica i uses one fixed
+    bootstrap member for its whole roll, so the member spread propagates."""
+
+    def __init__(self, est, n_rows, rng):
+        self.est = est
+        self.member = np.resize(rng.permutation(len(est.weights_[0])), n_rows)
+
+    def step(self, X):
+        out = np.empty(len(X))
+        for k in np.unique(self.member):
+            rows = np.flatnonzero(self.member == k)
+            out[rows] = self.est.predict_member(X[rows], k)
+        return out
+
+
 class Reconstruct_real_data:
     def __init__(self, data_dir='../Data', model_dir='../model', exp_id='No',
-                 anchor_real=False, n_draws=0, models=None, seed=12345):
+                 anchor_real=False, n_draws=0, models=None, seed=12345,
+                 out_dir=None, target='level', clip_dir=None,
+                 seed_noise=0.0, noise_models=('NN', 'GP', 'BNN'),
+                 propagate=()):
         self.data_dir = data_dir
+        # propagate: models (GP, BNN) whose own predictive uncertainty is sampled
+        # per replica inside the roll.  Output defaults to {data_dir}/propagate.
+        self.propagate = set(propagate)
+        if out_dir is None and self.propagate:
+            out_dir = os.path.join(data_dir, 'propagate')
+        # seed_noise K > 0: the seed M of noise_models gets N(0, K * omega * replica
+        # std at that omega) added (one draw shared by those models); other models keep
+        # the clean seed.  Output defaults to {data_dir}/seednoise_{K}.
+        self.seed_noise = seed_noise
+        self.noise_models = set(noise_models)
+        self.noise_rng = np.random.default_rng(seed + 1)
+        if out_dir is None and seed_noise > 0:
+            out_dir = os.path.join(data_dir, f'seednoise_{seed_noise:g}')
+        self.out_dir = out_dir or data_dir
+        os.makedirs(self.out_dir, exist_ok=True)
+        if os.path.abspath(self.out_dir) != os.path.abspath(data_dir):
+            # test_error.py --data_dir {out_dir} also needs these two
+            for f in ('All_p_w_m.csv', 'train_error_summary.csv'):
+                src, dst = os.path.join(data_dir, f), os.path.join(self.out_dir, f)
+                if os.path.exists(src) and not os.path.exists(dst):
+                    shutil.copy(src, dst)
+        # target='logratio': models predict log(M5/M4) (SegTest); the roll rebuilds
+        # M5 = M4 * exp(prediction), the prediction clipped per (P, omega) to
+        # {clip_dir}/logratio_clip_{fm}.csv when clip_dir is given
+        self.target = target
+        self.clip_dir = clip_dir
+        if target == 'logratio' and n_draws > 0:
+            raise ValueError('--n_draws is not supported with --target logratio')
         self.model_dir = model_dir
         self.exp_id = exp_id
         self.features = FEATURES[exp_id]
@@ -190,6 +307,35 @@ class Reconstruct_real_data:
         df['W'] = np.round(df['W'], W_DECIMALS)
         return df
 
+    def _load_clip(self, fm):
+        """{P: (W grid, lo, hi)} log-ratio clip table, or None."""
+        if self.target != 'logratio' or not self.clip_dir:
+            return None
+        path = os.path.join(self.clip_dir, f'logratio_clip_{fm}.csv')
+        if not os.path.exists(path):
+            raise FileNotFoundError(f'{path} not found')
+        t = pd.read_csv(path)
+        return {p: (g.W.to_numpy(), g.lo.to_numpy(), g.hi.to_numpy(), g.M_hi.to_numpy())
+                for p, g in t.sort_values('W').groupby('P')}
+
+    def _to_level(self, pred, name, m4, clip, p, w):
+        """Model output -> M at w5 (identity for target='level').  logratio: step clipped
+        to [lo, hi] and M capped at M_hi of the clip table (SegTest common.logratio_to_level)."""
+
+        if self.seed_noise > 0 and name in self.noise_models:
+            # add N(0, K * omega * replica std at that omega) to the seed M of noise_models
+            sd = np.nanstd(pred, axis=0) * w
+            pred += self.noise_rng.normal(size=pred.shape) * self.seed_noise * sd
+        
+        if self.target != 'logratio':
+            return pred
+        m4 = np.maximum(m4, 1e-6)       # a negative M4 would turn exp growth into a fall to -inf
+        if clip is None or p not in clip:
+            return m4 * np.exp(pred)
+        ws, lo, hi, m_hi = clip[p]
+        i = int(np.argmin(np.abs(ws - w)))
+        return np.minimum(m4 * np.exp(np.clip(pred, lo[i], hi[i])), m_hi[i])
+
     @staticmethod
     def _interleave(ws, ms):
         """row-wise [w1..w4] + [m1..m4] -> [w1, m1, w2, m2, w3, m3, w4, m4]."""
@@ -211,10 +357,14 @@ class Reconstruct_real_data:
             ordered_ps = sorted(df_syn.P.unique())
             models = self._load_models(fm, ordered_ps)
             names = list(models)
+            for name in [n for n in names if n in self.propagate]:
+                models[f'{name}_draw'] = models[name]
+                names.append(f'{name}_draw')
             if not names:
                 print(f'FM={fm}: no trained *_exp_{self.exp_id}.sav models, nothing saved')
                 continue
             all_ws = np.array(sorted(df_syn.W.unique()), dtype=float)
+            clip = self._load_clip(fm)
 
             P_parts, E_parts, W_parts = [], [], []
             anchored_parts = []
@@ -258,6 +408,17 @@ class Reconstruct_real_data:
                               .fillna(0.0).to_numpy())
                 seed_ws, seed_M = head_ws[-N_LAGS:], head_M[:, -N_LAGS:]
 
+                # per-model head: noisy copy for noise_models when --seed_noise > 0
+                head_by = {name: head_M for name in names}
+                if self.seed_noise > 0:
+                    # std grows with omega: K * omega * (replica spread at that omega)
+                    #sd = np.nanstd(head_M, axis=0) * head_ws
+                    #print(f'SD={sd}')
+                    noisy = head_M #+ self.noise_rng.normal(size=head_M.shape) * self.seed_noise * head_ws
+                    for name in names:
+                        if name in self.noise_models:
+                            head_by[name] = noisy
+
                 p_col = np.full(n_exp, p, dtype=float)
                 exp_col = exps.astype(float)
 
@@ -269,16 +430,28 @@ class Reconstruct_real_data:
                     W_parts.append(np.full(n_exp, w))
                     anchored_parts.append(head_real[:, j])
                     for name in names:
-                        pred_parts[name].append(head_M[:, j].copy())
+                        pred_parts[name].append(head_by[name][:, j].copy())
 
                 # per-model rolling lag window [w1, m1, ... w4, m4]
                 lag_ws = np.tile(seed_ws, (n_exp, 1))
-                state = {name: self._interleave(lag_ws, seed_M.copy()) for name in names}
+                state = {name: self._interleave(lag_ws, head_by[name][:, -N_LAGS:].copy())
+                         for name in names}
 
                 roll_ws = all_ws[all_ws > seed_ws[-1]]
                 if self.n_draws > 0 and 'GP' in names:
                     draw_parts.append(self._roll_draws(models['GP'][p], p, head_ws, head_M,
                                                        seed_ws, seed_M, roll_ws))
+
+                # propagated models roll twice: M_{X} deterministic (mean prediction)
+                # and M_{X}_draw (sampled); test_error.py takes the model error from
+                # their per-replica difference
+                samplers = {}
+                if 'GP_draw' in names:
+                    samplers['GP_draw'] = GPReplicaSampler(models['GP'][p], self.rng)
+                if 'BNN_draw' in names:
+                    samplers['BNN_draw'] = BNNReplicaSampler(models['BNN'][p], n_exp, self.rng)
+                if 'NNE_draw' in names:
+                    samplers['NNE_draw'] = EnsembleReplicaSampler(models['NNE'][p], n_exp, self.rng)
 
                 for w in roll_ws:
                     w5 = np.full(n_exp, w, dtype=float)
@@ -288,8 +461,11 @@ class Reconstruct_real_data:
                         cols = ([p_col, exp_col, state[name], w5] if self.use_exp
                                 else [p_col, state[name], w5])
                         X = pd.DataFrame(np.column_stack(cols), columns=self.features)
-                        pred = np.asarray(models[name][p].predict(X), dtype=float)
-                        step_val[name] = pred
+                        if name in samplers:
+                            pred = samplers[name].step(X.to_numpy(dtype=float))
+                        else:
+                            pred = np.asarray(models[name][p].predict(X), dtype=float)
+                        step_val[name] = self._to_level(pred, name, state[name][:, -1], clip, p, w)
 
                     P_parts.append(p_col.copy())
                     E_parts.append(exps)
@@ -318,7 +494,7 @@ class Reconstruct_real_data:
             }).sort_values(['P', 'Exp', 'W']).reset_index(drop=True)
 
             token = EXP_TOKEN[self.exp_id]
-            out_path = os.path.join(self.data_dir,
+            out_path = os.path.join(self.out_dir,
                                     f'Real_data_projected_{fm}_{token}{suffix}_v2.csv')
             df_out.to_csv(out_path, index=False)
             print(f'FM={fm} saved -> {out_path}  ({len(df_out)} rows)')
@@ -326,7 +502,7 @@ class Reconstruct_real_data:
             if draw_parts:
                 df_d = pd.concat(draw_parts, ignore_index=True)
                 df_d.insert(0, 'FM', fm)
-                d_path = os.path.join(self.data_dir,
+                d_path = os.path.join(self.out_dir,
                                       f'Real_data_projected_{fm}_{token}{suffix}_draws_v2.csv')
                 df_d.to_csv(d_path, index=False)
                 print(f'FM={fm} GP draws saved -> {d_path}  ({len(df_d)} rows)')
@@ -374,9 +550,28 @@ if __name__ == "__main__":
     parser.add_argument("--models", nargs='+', choices=MODEL_NAMES, default=MODEL_NAMES,
                         help="Models to roll (default: all with a saved .sav)")
     parser.add_argument("--seed", type=int, default=12345, help="RNG seed for --n_draws")
+    parser.add_argument("--out_dir", default=None,
+                        help="Where Real_data_projected_*.csv go (default: --data_dir)")
+    parser.add_argument("--target", default='level', choices=['level', 'logratio'],
+                        help="What the models predict: M5 (default) or log(M5/M4) (SegTest logratio runs)")
+    parser.add_argument("--clip_dir", default=None,
+                        help="logratio only: directory with logratio_clip_{fm}.csv (per-P, per-omega step limits)")
+    parser.add_argument("--seed_noise", type=float, default=0.0,
+                        help="Add N(0, K * omega * replica std at each seed omega) to the seed M of "
+                             "--noise_models (0 = off). Output -> {data_dir}/seednoise_{K} unless --out_dir")
+    parser.add_argument("--noise_models", nargs='+', choices=MODEL_NAMES, default=['NN', 'GP', 'BNN'],
+                        help="Models whose seed gets --seed_noise (others keep the clean seed)")
+    parser.add_argument("--propagate", nargs='*', choices=['GP', 'BNN', 'NNE'], default=[],
+                        help="Sample these models' own predictive uncertainty per replica inside the "
+                             "roll (GP latent draw per step, BNN one posterior draw / NNE one ensemble member per replica). "
+                             "Each adds an M_{X}_draw column next to the deterministic M_{X}. "
+                             "Output -> {data_dir}/propagate unless --out_dir")
     args = parser.parse_args()
 
     rd = Reconstruct_real_data(data_dir=args.data_dir, model_dir=args.model_dir,
                                exp_id=args.exp_id, anchor_real=args.anchor_real,
-                               n_draws=args.n_draws, models=args.models, seed=args.seed)
+                               n_draws=args.n_draws, models=args.models, seed=args.seed,
+                               out_dir=args.out_dir, target=args.target, clip_dir=args.clip_dir,
+                               seed_noise=args.seed_noise, noise_models=args.noise_models,
+                               propagate=args.propagate)
     rd.reconstruct_data()

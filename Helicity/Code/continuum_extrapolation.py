@@ -128,7 +128,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", default='../Data/2026',
                         help="Where to read best_model_I_no_exp_<model>.csv and write "
                              "I_omega_continuum.csv and Images/")
-    parser.add_argument("--model", choices=['GB', 'RF', 'XGB', 'NN', 'GP'], default=None,
+    parser.add_argument("--model", choices=['GB', 'RF', 'XGB', 'NN', 'GP', 'BNN'], default=None,
                         help="Model (default: overall #1 in test_error_ranking_no_exp.csv)")
     args = parser.parse_args()
     model = best_model(args.data_dir, model=args.model)

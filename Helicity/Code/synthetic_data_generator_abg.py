@@ -1207,10 +1207,11 @@ def max_n_exp_per_fm(data=None):
     return n_per_fm_p.groupby(level='FM').max().to_dict()
 
 
-def generate_synthetic_exp_data(new_M_S=None, N_fm=None, seed=12345):
+def generate_synthetic_exp_data(new_M_S=None, N_fm=None, seed=12345, smooth=True):
     """Steps 4-5: for each (FM, P, W) draw N_fm[FM] i.i.d. replicas of M from
     Normal(Est_M, Est_S) truncated to M >= 0 -- N_fm Exp replicas at every
-    omega on the full 0..20 grid.
+    omega on the full 0..20 grid -- then (``smooth``, default) Savitzky-Golay
+    smooth each replica's own M(omega) curve within each (FM, P).
 
     M (RpITD) is a physically non-negative magnitude, so an unbounded
     Normal is wrong here: wherever Est_S is comparable to Est_M (the W=0
@@ -1247,10 +1248,15 @@ def generate_synthetic_exp_data(new_M_S=None, N_fm=None, seed=12345):
                                        size=(len(g), n), random_state=rng)
         samples = np.where(sigma[:, None] > 0, samples, mu[:, None])
 
-        # No smoothing of the replicas: a per-replica Savitzky-Golay pass along
-        # omega shrank the spread ~3-5x in the interior and inflated it ~6x (and
-        # biased the mean) at the first omega points, so std(M) no longer matched
-        # Est_S.  The raw draws keep mean = Est_M and std = Est_S at every omega.
+        # Per-replica Savitzky-Golay smoothing along omega (get_smooth_curve's
+        # window/order), within each P block (g is sorted P, W), so each replica
+        # is a smooth curve instead of i.i.d. jitter.  Trade-off: it shrinks the
+        # Exp spread ~3-5x in the interior and inflates it (and biases the mean)
+        # at the first omega points, so std(M) no longer equals Est_S there.
+        # --no_smooth keeps the raw draws (mean = Est_M, std = Est_S everywhere).
+        if smooth:
+            for idx in g.groupby('P').indices.values():
+                samples[idx, :] = np.apply_along_axis(get_smooth_curve, 0, samples[idx, :])
         parts.append(pd.DataFrame({
             'FM': np.repeat(g['FM'].to_numpy(), n),
             'W': np.repeat(g['W'].to_numpy(), n),
@@ -1267,7 +1273,7 @@ def generate_synthetic_exp_data(new_M_S=None, N_fm=None, seed=12345):
     return out
 
 
-def generate_m_omega_from_distribution():
+def generate_m_omega_from_distribution(smooth=True):
     """Full pipeline: new_M.csv's (FM,P,W)->Est_M, plus a linear-model
     extrapolation of std(omega), used as (mu, sigma) to draw N_fm synthetic
     Exp replicas of M per (FM,P,W). See ``extrapolate_std_to_new_M`` /
@@ -1277,7 +1283,8 @@ def generate_m_omega_from_distribution():
     new_M_S = extrapolate_std_to_new_M(data)
     N_fm = max_n_exp_per_fm(data)
     print('N_fm (max real Exp count per FM):', N_fm)
-    generate_synthetic_exp_data(new_M_S, N_fm)
+    print(f'per-replica smoothing along omega: {"on" if smooth else "off (--no_smooth)"}')
+    generate_synthetic_exp_data(new_M_S, N_fm, smooth=smooth)
 
 
 def generate_I_omega():
@@ -1375,6 +1382,9 @@ def _parse_args():
     parser.add_argument('--simulate', action='store_true',
                         help='Only write per-iteration frames of the alpha/beta/gamma fit to '
                              'Images/simulation/FM_{fm}/ (simulate_fit); nothing else is run.')
+    parser.add_argument('--no_smooth', action='store_true',
+                        help='Keep the raw i.i.d. replica draws (no per-replica Savitzky-Golay '
+                             'smoothing along omega in generate_synthetic_exp_data).')
     return parser.parse_args()
 
 
@@ -1409,4 +1419,4 @@ if __name__ == '__main__':
         plot_std_vs_w(data)
         plot_mean_median_and_qq(data)
 
-        generate_m_omega_from_distribution()
+        generate_m_omega_from_distribution(smooth=not args.no_smooth)
